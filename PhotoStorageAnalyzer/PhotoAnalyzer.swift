@@ -108,7 +108,7 @@ public struct SimilarPhotoGroup: Identifiable, Hashable {
 }
 
 public struct LocationGroup: Identifiable, Codable, Hashable {
-    public var id: String { name }
+    public let id: String
     public let name: String
     public let count: Int
     public let size: Int64
@@ -252,7 +252,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             guard let data = try? Data(contentsOf: fileURL),
                   let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return }
             
-            let cleaned = decoded.filter { !$0.value.hasPrefix("Location (") && !$0.value.contains(",") }
+            let cleaned = decoded.filter { !$0.value.hasPrefix("Location (") }
             
             DispatchQueue.main.async {
                 self.locationCache = cleaned
@@ -286,7 +286,14 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             let count = fetchResult.count
             
             #if targetEnvironment(simulator)
-            if count < 15 || self.authorizationStatus == .denied || self.authorizationStatus == .restricted {
+            var hasLocationAssets = false
+            fetchResult.enumerateObjects { asset, _, stop in
+                if asset.location != nil {
+                    hasLocationAssets = true
+                    stop.pointee = true
+                }
+            }
+            if count < 15 || !hasLocationAssets || self.authorizationStatus == .denied || self.authorizationStatus == .restricted {
                 try? await Task.sleep(nanoseconds: 800_000_000)
                 self.generateMockAssets()
                 self.isScanning = false
@@ -350,16 +357,27 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
                 let batchEnd = min(batchStart + batchSize, newCount)
                 let batch = Array(newAssets[batchStart..<batchEnd])
                 
-                // Process batch concurrently — PHAssetResource reads are I/O but non-blocking
+                // Process batch concurrently — limited to 6 concurrent tasks to prevent XPC timeouts/hangs
                 let batchResults: [AnalyzedAsset] = await withTaskGroup(of: AnalyzedAsset.self) { group in
+                    var added = 0
+                    var out: [AnalyzedAsset] = []
+                    out.reserveCapacity(batch.count)
+                    
                     for asset in batch {
+                        if added >= 6 {
+                            if let result = await group.next() {
+                                out.append(result)
+                            }
+                        }
                         group.addTask {
                             self.analyzeAsset(asset, locationCacheSnapshot: locationCacheSnapshot)
                         }
+                        added += 1
                     }
-                    var out: [AnalyzedAsset] = []
-                    out.reserveCapacity(batch.count)
-                    for await result in group { out.append(result) }
+                    
+                    while let result = await group.next() {
+                        out.append(result)
+                    }
                     return out
                 }
                 
@@ -409,7 +427,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             lon = loc.coordinate.longitude
             let key = geoKey(loc.coordinate.latitude, loc.coordinate.longitude)
             locName = locationCacheSnapshot[key]
-            if locName?.hasPrefix("Location (") == true || locName?.contains(",") == true {
+            if locName?.hasPrefix("Location (") == true {
                 locName = nil
             }
         }
@@ -518,7 +536,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             let displayName: String
             let needsGeocode: Bool
             
-            if let name = name, !name.hasPrefix("Location ("), !name.contains(",") {
+            if let name = name, !name.hasPrefix("Location (") {
                 displayName = name
                 needsGeocode = false
             } else {
@@ -527,6 +545,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             }
             
             tempGroups.append(LocationGroup(
+                id: key,
                 name: displayName,
                 count: groupAssets.count,
                 size: groupAssets.reduce(0) { $0 + $1.fileSize },
@@ -669,6 +688,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             for (key, assets) in groups {
                 let name = cacheCopy[key] ?? "Exploring…"
                 tempGroups.append(LocationGroup(
+                    id: key,
                     name: name,
                     count: assets.count,
                     size: assets.reduce(0) { $0 + $1.fileSize },

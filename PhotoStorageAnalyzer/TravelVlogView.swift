@@ -104,7 +104,6 @@ struct TravelVlogView: View {
     @State private var displayedCitiesCount = 0
     @State private var displayedMarkers: [LocationMarker] = []
     @State private var selectedCity: LocationGroup? = nil
-    @State private var showMap = false
     @State private var isProcessing = true
 
     private var availableYears: [Int] {
@@ -135,15 +134,10 @@ struct TravelVlogView: View {
                             .padding(.horizontal, 16)
                             .padding(.top, 8)
                     } else {
-                        if showMap {
-                            mapCard
-                                .opacity(appeared ? 1 : 0)
-                                .offset(y: appeared ? 0 : -12)
-                                .animation(.spring(response: 0.5, dampingFraction: 0.8), value: appeared)
-                                .transition(.opacity.combined(with: .scale(scale: 0.95)))
-                        } else {
-                            showMapPlaceholder
-                        }
+                        mapCard
+                            .opacity(appeared ? 1 : 0)
+                            .offset(y: appeared ? 0 : -12)
+                            .animation(.spring(response: 0.5, dampingFraction: 0.8), value: appeared)
                     }
 
                     if isProcessing {
@@ -287,7 +281,7 @@ struct TravelVlogView: View {
     // MARK: - Map Card
     private var mapCard: some View {
         ZStack(alignment: .bottomTrailing) {
-            Map(coordinateRegion: $mapRegion, annotationItems: displayedMarkers) { marker in
+            Map(coordinateRegion: $mapRegion, interactionModes: [], annotationItems: displayedMarkers) { marker in
                 MapAnnotation(coordinate: marker.coordinate) {
                     Button(action: {
                         selectedCity = analyzer.locationsBreakdown.first(where: { $0.name == marker.name })
@@ -320,45 +314,7 @@ struct TravelVlogView: View {
         .padding(.top, 8)
     }
 
-    private var showMapPlaceholder: some View {
-        Button {
-            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
-                showMap = true
-            }
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: "map.fill")
-                    .font(.title2)
-                    .foregroundColor(.purple)
-                    .frame(width: 48, height: 48)
-                    .background(Color.purple.opacity(0.1))
-                    .cornerRadius(12)
-                
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Show Interactive Map")
-                        .font(.headline)
-                        .foregroundColor(.primary)
-                    Text("Load \(displayedMarkers.count) travel locations on the map")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right")
-                    .foregroundColor(.secondary)
-            }
-            .padding(16)
-            .background(Color(.secondarySystemGroupedBackground))
-            .cornerRadius(20)
-            .overlay(
-                RoundedRectangle(cornerRadius: 20)
-                    .stroke(Color.black.opacity(0.05), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.04), radius: 8, y: 4)
-            .padding(.horizontal, 16)
-            .padding(.top, 8)
-        }
-        .buttonStyle(.plain)
-    }
+
 
     // MARK: - Stats row
     private var statsRow: some View {
@@ -527,7 +483,7 @@ struct TravelVlogView: View {
             latitudeDelta: max((maxLat - minLat) * 1.5, 5),
             longitudeDelta: max((maxLon - minLon) * 1.5, 5)
         )
-        withAnimation(.easeInOut(duration: 0.8)) { mapRegion = MKCoordinateRegion(center: center, span: span) }
+        mapRegion = MKCoordinateRegion(center: center, span: span)
     }
 }
 
@@ -784,7 +740,7 @@ struct TripCard: View {
                     // Text info
                     HStack(spacing: 6) {
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(city.name)
+                            Text(city.name.components(separatedBy: ",").first ?? city.name)
                                 .font(.system(.subheadline, design: .rounded, weight: .bold))
                                 .foregroundColor(.primary)
                                 .lineLimit(1)
@@ -814,6 +770,7 @@ struct TripCard: View {
             .padding(.leading, 12)
             .padding(.bottom, isLast ? 0 : 14)
         }
+        .fixedSize(horizontal: false, vertical: true)
     }
 }
 

@@ -6,6 +6,7 @@ struct ContentView: View {
     @State private var selectedTab = 0
     @State private var selectedFilter: AppFilter = .all
     @State private var spinAngle: Double = 0
+    @State private var isAnimating = false
     
     var body: some View {
         Group {
@@ -174,96 +175,129 @@ struct ContentView: View {
         }
     }
     
-    // Loading / Scanning View
+    // Loading / Scanning View (Premium Splash View Interface)
     private var scanningView: some View {
         ZStack {
-            Color.mainBg.ignoresSafeArea()
+            // Soft premium background gradient
+            LinearGradient(
+                colors: [Color.white, Color(red: 0.96, green: 0.96, blue: 0.98)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .ignoresSafeArea()
             
-            VStack(spacing: 32) {
+            // Soft background grid pattern for visual texture
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    Circle()
+                        .fill(Color.purple.opacity(0.04))
+                        .frame(width: 300, height: 300)
+                        .blur(radius: 50)
+                        .offset(x: 100, y: 100)
+                }
+            }
+            .ignoresSafeArea()
+            
+            VStack(spacing: 36) {
                 Spacer()
                 
-                // Icon + pulse ring
+                // Centered Brand Icon & Pulsing Rings
                 ZStack {
-                    // Outer pulsing glow
+                    // Pulsing Outer Aura
                     Circle()
-                        .fill(Color.purple.opacity(0.08))
-                        .frame(width: 160, height: 160)
+                        .stroke(Color.purple.opacity(0.15), lineWidth: 1)
+                        .frame(width: 150, height: 150)
+                        .scaleEffect(isAnimating ? 1.12 : 0.98)
+                        .opacity(isAnimating ? 0.0 : 1.0)
                     
-                    // Track ring
                     Circle()
-                        .stroke(Color.purple.opacity(0.1), lineWidth: 10)
-                        .frame(width: 130, height: 130)
+                        .fill(Color.purple.opacity(0.03))
+                        .frame(width: 110, height: 110)
+                        .scaleEffect(isAnimating ? 1.05 : 0.95)
                     
-                    // Progress arc (or animated spinner if progress = 0)
-                    if analyzer.scanProgress > 0 {
-                        Circle()
-                            .trim(from: 0.0, to: CGFloat(analyzer.scanProgress))
-                            .stroke(
-                                LinearGradient(
-                                    colors: [.purple, .blue],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                style: StrokeStyle(lineWidth: 10, lineCap: .round)
+                    // App Logo with modern gradient & shadow
+                    Image(systemName: "photo.stack.fill")
+                        .font(.system(size: 44))
+                        .foregroundStyle(
+                            LinearGradient(
+                                colors: [.purple, .blue],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
                             )
-                            .frame(width: 130, height: 130)
-                            .rotationEffect(.degrees(-90))
-                            .animation(.spring(response: 0.45, dampingFraction: 0.8), value: analyzer.scanProgress)
-                    } else {
-                        // Indeterminate spinner while waiting to start
-                        Circle()
-                            .trim(from: 0.0, to: 0.25)
-                            .stroke(
-                                LinearGradient(
-                                    colors: [.purple, .blue],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                ),
-                                style: StrokeStyle(lineWidth: 10, lineCap: .round)
-                            )
-                            .frame(width: 130, height: 130)
-                            .rotationEffect(.degrees(spinAngle))
-                            .onAppear {
-                                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
-                                    spinAngle = 360
-                                }
-                            }
-                    }
-                    
-                    // Center content
-                    VStack(spacing: 4) {
-                        if analyzer.scanProgress > 0 {
-                            Text(String(format: "%.0f%%", analyzer.scanProgress * 100))
-                                .font(.system(size: 26, weight: .bold, design: .rounded))
-                                .foregroundColor(.primary)
-                            Text("\(analyzer.totalScanned) / \(analyzer.totalAssetsCount)")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        } else {
-                            Image(systemName: "photo.stack.fill")
-                                .font(.system(size: 32))
-                                .foregroundStyle(
-                                    LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
-                                )
-                        }
+                        )
+                        .shadow(color: .purple.opacity(0.25), radius: 10, y: 5)
+                }
+                .onAppear {
+                    withAnimation(.easeInOut(duration: 1.8).repeatForever(autoreverses: true)) {
+                        isAnimating = true
                     }
                 }
                 
-                VStack(spacing: 10) {
-                    Text(analyzer.scanProgress > 0 ? "Analyzing Photo Library" : "Loading…")
-                        .font(.system(.title3, design: .rounded, weight: .bold))
+                VStack(spacing: 12) {
+                    Text("Photo Storage Analyzer")
+                        .font(.system(.title2, design: .rounded, weight: .bold))
                         .foregroundColor(.primary)
                     
-                    Text(analyzer.scanProgress > 0
-                         ? "Reading file metadata, matching duplicates, and calculating iCloud sync states…"
-                         : "Preparing to scan your photo library")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 48)
+                    if analyzer.totalAssetsCount > 0 {
+                        Text("Analyzing photo library metadata…")
+                            .font(.system(.subheadline, design: .rounded))
+                            .foregroundColor(.secondary)
+                    } else {
+                        Text("Preparing storage database…")
+                            .font(.system(.subheadline, design: .rounded))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                
+                // Elegant loading bar (smooth capsule track)
+                VStack(spacing: 8) {
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.purple.opacity(0.08))
+                            .frame(height: 6)
+                        
+                        if analyzer.scanProgress > 0 {
+                            Capsule()
+                                .fill(
+                                    LinearGradient(
+                                        colors: [.purple, .blue],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: max(12, 240 * CGFloat(analyzer.scanProgress)), height: 6)
+                                .animation(.spring(response: 0.35, dampingFraction: 0.8), value: analyzer.scanProgress)
+                        } else {
+                            // Shimmer indicator
+                            Capsule()
+                                .fill(LinearGradient(colors: [.purple.opacity(0.3), .blue.opacity(0.3)], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: 40, height: 6)
+                                .offset(x: isAnimating ? 200 : 0)
+                                .animation(.linear(duration: 1.5).repeatForever(autoreverses: false), value: isAnimating)
+                        }
+                    }
+                    .frame(width: 240)
+                    
+                    if analyzer.totalAssetsCount > 0 {
+                        Text("\(analyzer.totalScanned) of \(analyzer.totalAssetsCount) files processed")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary.opacity(0.8))
+                    } else {
+                        Text("Initializing connection…")
+                            .font(.system(.caption2, design: .rounded))
+                            .foregroundColor(.secondary.opacity(0.8))
+                    }
                 }
                 
                 Spacer()
+                
+                Text("EXODE DESIGN SYSTEM")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundColor(.secondary.opacity(0.4))
+                    .tracking(2.0)
+                    .padding(.bottom, 20)
             }
         }
     }
