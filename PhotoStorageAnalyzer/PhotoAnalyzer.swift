@@ -634,42 +634,91 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
               let lon = Double(parts[1]) else { return }
         
         inFlightGeocodes.insert(key)
-        let location = CLLocation(latitude: lat, longitude: lon)
         
-        CLGeocoder().reverseGeocodeLocation(location) { [weak self] placemarks, _ in
-            guard let self else { return }
-            let city = placemarks?.first.flatMap {
-                $0.locality ?? $0.subAdministrativeArea ?? $0.administrativeArea ?? $0.name
-            } ?? key
-            let country = placemarks?.first?.country ?? ""
-            let name = country.isEmpty ? city : "\(city), \(country)"
+        Task {
+            let name = await performHTTPGeocode(latitude: lat, longitude: lon)
             
-            DispatchQueue.main.async {
-                self.inFlightGeocodes.remove(key)
-                guard self.locationCache[key] != name else { return } // no-op if same
-                self.locationCache[key] = name
-                self.saveLocationCache()
-                
-                // O(1) update using pre-built index — no O(n) loop
-                if let indices = self.geoKeyToIndices[key] {
-                    for idx in indices where idx < self.analyzedAssets.count {
-                        var a = self.analyzedAssets[idx]
-                        a = AnalyzedAsset(
-                            localIdentifier: a.localIdentifier, fileName: a.fileName,
-                            fileSize: a.fileSize, isLocallyAvailable: a.isLocallyAvailable,
-                            mediaType: a.mediaType, isScreenshot: a.isScreenshot,
-                            isLivePhoto: a.isLivePhoto, creationDate: a.creationDate,
-                            duration: a.duration, syncStatus: a.syncStatus,
-                            locationName: name, latitude: a.latitude, longitude: a.longitude
-                        )
-                        self.analyzedAssets[idx] = a
+            if let resolvedName = name {
+                await updateLocationName(key: key, name: resolvedName)
+            } else {
+                let location = CLLocation(latitude: lat, longitude: lon)
+                CLGeocoder().reverseGeocodeLocation(location) { [weak self] placemarks, _ in
+                    guard let self else { return }
+                    let city = placemarks?.first.flatMap {
+                        $0.locality ?? $0.subAdministrativeArea ?? $0.administrativeArea ?? $0.name
+                    }
+                    let country = placemarks?.first?.country ?? ""
+                    
+                    let fallbackName: String
+                    if let city = city {
+                        fallbackName = country.isEmpty ? city : "\(city), \(country)"
+                    } else {
+                        fallbackName = String(format: "Location (%.2f, %.2f)", lat, lon)
+                    }
+                    
+                    Task {
+                        await self.updateLocationName(key: key, name: fallbackName)
                     }
                 }
-                
-                // Refresh only locations breakdown (not full recalc)
-                self.refreshLocationsBreakdownOnly()
             }
         }
+    }
+    
+    private func performHTTPGeocode(latitude: Double, longitude: Double) async -> String? {
+        let urlString = "https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=\(latitude)&longitude=\(longitude)&localityLanguage=en"
+        guard let url = URL(string: urlString) else { return nil }
+        
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 2.0 // Strict 2 second timeout to prevent hangs
+        request.setValue("PhotoStorageAnalyzer/1.0", forHTTPHeaderField: "User-Agent")
+        
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else { return nil }
+            
+            struct BigDataCloudResponse: Codable {
+                let city: String?
+                let locality: String?
+                let principalSubdivision: String?
+                let countryName: String?
+            }
+            
+            let decoded = try JSONDecoder().decode(BigDataCloudResponse.self, from: data)
+            let city = decoded.city ?? decoded.locality ?? decoded.principalSubdivision
+            let country = decoded.countryName ?? ""
+            
+            if let city = city, !city.isEmpty {
+                return country.isEmpty ? city : "\(city), \(country)"
+            }
+            return nil
+        } catch {
+            return nil
+        }
+    }
+    
+    @MainActor
+    private func updateLocationName(key: String, name: String) {
+        self.inFlightGeocodes.remove(key)
+        guard self.locationCache[key] != name else { return }
+        self.locationCache[key] = name
+        self.saveLocationCache()
+        
+        if let indices = self.geoKeyToIndices[key] {
+            for idx in indices where idx < self.analyzedAssets.count {
+                var a = self.analyzedAssets[idx]
+                a = AnalyzedAsset(
+                    localIdentifier: a.localIdentifier, fileName: a.fileName,
+                    fileSize: a.fileSize, isLocallyAvailable: a.isLocallyAvailable,
+                    mediaType: a.mediaType, isScreenshot: a.isScreenshot,
+                    isLivePhoto: a.isLivePhoto, creationDate: a.creationDate,
+                    duration: a.duration, syncStatus: a.syncStatus,
+                    locationName: name, latitude: a.latitude, longitude: a.longitude
+                )
+                self.analyzedAssets[idx] = a
+            }
+        }
+        
+        self.refreshLocationsBreakdownOnly()
     }
     
     private func refreshLocationsBreakdownOnly() {
