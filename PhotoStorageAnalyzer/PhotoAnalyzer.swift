@@ -146,6 +146,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     private var scanTask: Task<Void, Never>?
     private var locationCache: [String: String] = [:]
     private var assetCache: [String: PHAsset] = [:]
+    private var inFlightGeocodes: Set<String> = []
     
     public override init() {
         super.init()
@@ -505,7 +506,8 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             )
             tempGroups.append(group)
             
-            if self.locationCache[coordinateKey] == nil {
+            if self.locationCache[coordinateKey] == nil && !self.inFlightGeocodes.contains(coordinateKey) {
+                self.inFlightGeocodes.insert(coordinateKey)
                 geocodeCoordinateKey(coordinateKey, assets: assets)
             }
         }
@@ -523,7 +525,12 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         
         let location = CLLocation(latitude: lat, longitude: lon)
         CLGeocoder().reverseGeocodeLocation(location) { placemarks, error in
-            guard let placemark = placemarks?.first else { return }
+            guard let placemark = placemarks?.first else {
+                DispatchQueue.main.async {
+                    self.inFlightGeocodes.remove(key)
+                }
+                return
+            }
             
             // Check granular fields: locality (city), subAdmin (county), admin (state), landmark name
             let city = placemark.locality ?? placemark.subAdministrativeArea ?? placemark.administrativeArea ?? placemark.name ?? "Unknown Location"
@@ -531,6 +538,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             let name = country.isEmpty ? city : "\(city), \(country)"
             
             DispatchQueue.main.async {
+                self.inFlightGeocodes.remove(key)
                 self.locationCache[key] = name
                 self.saveLocationCache()
                 
