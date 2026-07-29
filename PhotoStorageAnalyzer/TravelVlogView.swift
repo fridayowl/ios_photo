@@ -2,152 +2,358 @@ import SwiftUI
 import MapKit
 import Photos
 
-// MARK: - Premium Travel Vlog View
+// MARK: - Global image cache (prevents reloading on scroll)
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private var cache = NSCache<NSString, UIImage>()
+    private init() { cache.countLimit = 300 }
+
+    func get(_ id: String) -> UIImage? { cache.object(forKey: id as NSString) }
+    func set(_ id: String, _ img: UIImage) { cache.setObject(img, forKey: id as NSString) }
+}
+
+// MARK: - Image loader (runs on background, no main thread block)
+@MainActor
+final class CellImageLoader: ObservableObject {
+    @Published var image: UIImage?
+    private var requestID: PHImageRequestID?
+
+    func load(identifier: String, size: CGFloat = 200) {
+        if let cached = ThumbnailCache.shared.get(identifier) { image = cached; return }
+        let results = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        guard let asset = results.firstObject else { return }
+        let opts = PHImageRequestOptions()
+        opts.deliveryMode = .opportunistic
+        opts.isNetworkAccessAllowed = false
+        opts.isSynchronous = false
+        opts.resizeMode = .fast
+        let target = CGSize(width: size, height: size)
+        requestID = PHImageManager.default().requestImage(
+            for: asset, targetSize: target, contentMode: .aspectFill, options: opts
+        ) { [weak self] img, _ in
+            guard let self, let img else { return }
+            ThumbnailCache.shared.set(identifier, img)
+            DispatchQueue.main.async { self.image = img }
+        }
+    }
+
+    func cancel() {
+        if let id = requestID { PHImageManager.default().cancelImageRequest(id); requestID = nil }
+    }
+}
+
+// MARK: - Helpers
+private func fmtMonth(_ d: Date) -> String {
+    let f = DateFormatter(); f.dateFormat = "MMM yyyy"; return f.string(from: d)
+}
+private func fmtYear(_ d: Date) -> String {
+    let f = DateFormatter(); f.dateFormat = "yyyy"; return f.string(from: d)
+}
+private func fmtDay(_ d: Date) -> String {
+    let f = DateFormatter(); f.dateStyle = .medium; return f.string(from: d)
+}
+
+// MARK: - Main TravelVlogView
 struct TravelVlogView: View {
     @EnvironmentObject var analyzer: PhotoAnalyzer
+
+    // Filters
+    @State private var selectedYear: Int? = nil
+    @State private var selectedMonth: Int? = nil   // 1-12
     @State private var isMapExpanded = false
     @State private var appeared = false
-    @State private var selectedAsset: AnalyzedAsset? = nil
     @State private var mapRegion = MKCoordinateRegion(
-        center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0),
-        span: MKCoordinateSpan(latitudeDelta: 120.0, longitudeDelta: 120.0)
+        center: CLLocationCoordinate2D(latitude: 30, longitude: 15),
+        span: MKCoordinateSpan(latitudeDelta: 100, longitudeDelta: 120)
     )
 
-    private var sortedCities: [LocationGroup] {
+    // Pre-computed
+    private var allCities: [LocationGroup] {
         analyzer.locationsBreakdown.sorted {
             ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
         }
     }
 
+    private var availableYears: [Int] {
+        let cal = Calendar.current
+        let years = Set(allCities.compactMap { $0.assets.first?.creationDate }.map { cal.component(.year, from: $0) })
+        return years.sorted(by: >)
+    }
+
+    private var availableMonths: [Int] {
+        guard let year = selectedYear else { return [] }
+        let cal = Calendar.current
+        let months = Set(allCities.compactMap { city -> Int? in
+            guard let d = city.assets.first?.creationDate,
+                  cal.component(.year, from: d) == year else { return nil }
+            return cal.component(.month, from: d)
+        })
+        return months.sorted(by: >)
+    }
+
+    private var filteredCities: [LocationGroup] {
+        let cal = Calendar.current
+        return allCities.filter { city in
+            guard let d = city.assets.first?.creationDate else { return false }
+            let y = cal.component(.year, from: d)
+            let m = cal.component(.month, from: d)
+            if let sy = selectedYear, sy != y { return false }
+            if let sm = selectedMonth, sm != m { return false }
+            return true
+        }
+    }
+
+    // Group by year+month for section headers
+    private var groupedByMonth: [(String, [LocationGroup])] {
+        var groups: [String: [LocationGroup]] = [:]
+        var orderMap: [String: Date] = [:]
+        for city in filteredCities {
+            guard let d = city.assets.first?.creationDate else { continue }
+            let key = fmtMonth(d)
+            groups[key, default: []].append(city)
+            if orderMap[key] == nil { orderMap[key] = d }
+        }
+        return groups.sorted { (orderMap[$0.key] ?? .distantPast) > (orderMap[$1.key] ?? .distantPast) }
+    }
+
     var body: some View {
-        ScrollView(showsIndicators: false) {
-            VStack(alignment: .leading, spacing: 0) {
-                // HERO MAP
-                heroMapSection
-                    .offset(y: appeared ? 0 : -20)
+        NavigationStack {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 0) {
+
+                    // ── MAP ──────────────────────────────────────────────
+                    mapCard
+                        .opacity(appeared ? 1 : 0)
+                        .offset(y: appeared ? 0 : -12)
+                        .animation(.spring(response: 0.5, dampingFraction: 0.8), value: appeared)
+
+                    // ── STATS ────────────────────────────────────────────
+                    statsRow
+                        .padding(.horizontal, 16)
+                        .padding(.top, 14)
+                        .opacity(appeared ? 1 : 0)
+                        .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.08), value: appeared)
+
+                    // ── YEAR PICKER ──────────────────────────────────────
+                    yearPicker
+                        .padding(.top, 18)
+                        .opacity(appeared ? 1 : 0)
+                        .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.14), value: appeared)
+
+                    // ── MONTH CHIPS (only when year selected) ───────────
+                    if selectedYear != nil {
+                        monthChips
+                            .padding(.top, 10)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+
+                    // ── JOURNEY HEADER ───────────────────────────────────
+                    HStack(spacing: 8) {
+                        RoundedRectangle(cornerRadius: 2)
+                            .fill(Color.purple)
+                            .frame(width: 4, height: 20)
+                        Text(selectedYear == nil ? "All Journeys" : (selectedMonth == nil ? "Year \(selectedYear!)" : monthName(selectedMonth!)))
+                            .font(.system(.title3, design: .rounded, weight: .bold))
+                            .foregroundColor(.primary)
+                        Spacer()
+                        if filteredCities.count > 0 {
+                            Text("\(filteredCities.count) places")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.top, 22)
+                    .padding(.bottom, 6)
                     .opacity(appeared ? 1 : 0)
+                    .animation(.easeOut.delay(0.2), value: appeared)
 
-                // STATS ROW
-                statsRow
-                    .padding(.horizontal, 20)
-                    .padding(.top, 20)
-                    .offset(y: appeared ? 0 : 15)
-                    .opacity(appeared ? 1 : 0)
-                    .animation(.spring(response: 0.55, dampingFraction: 0.75).delay(0.1), value: appeared)
-
-                // SECTION TITLE
-                HStack {
-                    Rectangle()
-                        .fill(Color.purple)
-                        .frame(width: 3, height: 18)
-                        .cornerRadius(2)
-                    Text("Your Journey")
-                        .font(.system(.title3, design: .rounded, weight: .bold))
-                        .foregroundColor(.primary)
-                }
-                .padding(.horizontal, 20)
-                .padding(.top, 28)
-                .padding(.bottom, 4)
-                .offset(y: appeared ? 0 : 15)
-                .opacity(appeared ? 1 : 0)
-                .animation(.spring(response: 0.55, dampingFraction: 0.75).delay(0.2), value: appeared)
-
-                // TIMELINE CARDS
-                VStack(spacing: 0) {
-                    ForEach(Array(sortedCities.enumerated()), id: \.element.id) { index, city in
-                        TripCard(city: city, index: index, isLast: index == sortedCities.count - 1, appeared: appeared)
-                            .animation(
-                                .spring(response: 0.6, dampingFraction: 0.78).delay(0.18 + Double(index) * 0.07),
-                                value: appeared
-                            )
-                            .onTapGesture {
-                                selectedAsset = city.assets.first
+                    // ── TIMELINE ─────────────────────────────────────────
+                    if filteredCities.isEmpty {
+                        VStack(spacing: 12) {
+                            Image(systemName: "mappin.slash")
+                                .font(.system(size: 40))
+                                .foregroundColor(.secondary.opacity(0.35))
+                            Text("No trips for this period")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 60)
+                    } else {
+                        LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                            ForEach(groupedByMonth, id: \.0) { monthLabel, cities in
+                                Section {
+                                    ForEach(Array(cities.enumerated()), id: \.element.id) { idx, city in
+                                        TripCard(
+                                            city: city,
+                                            isLast: idx == cities.count - 1,
+                                            appeared: appeared
+                                        )
+                                        .padding(.horizontal, 18)
+                                        .opacity(appeared ? 1 : 0)
+                                        .offset(x: appeared ? 0 : 24)
+                                        .animation(
+                                            .spring(response: 0.55, dampingFraction: 0.78)
+                                                .delay(0.22 + Double(idx) * 0.06),
+                                            value: appeared
+                                        )
+                                    }
+                                } header: {
+                                    MonthSectionHeader(label: monthLabel)
+                                }
                             }
+                        }
+                        .padding(.bottom, 32)
                     }
                 }
-                .padding(.horizontal, 20)
-                .padding(.top, 8)
-                .padding(.bottom, 32)
             }
-        }
-        .background(Color(UIColor.systemGroupedBackground))
-        .navigationTitle("Travel Vlog")
-        .navigationBarTitleDisplayMode(.large)
-        .toolbar {
-            ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
-                    isMapExpanded = true
-                } label: {
-                    Label("Full Map", systemImage: "map")
-                        .font(.subheadline)
-                        .foregroundColor(.purple)
+            .background(Color(UIColor.systemGroupedBackground))
+            .navigationTitle("Travel Vlog")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { isMapExpanded = true } label: {
+                        Image(systemName: "map.fill")
+                            .foregroundColor(.purple)
+                    }
                 }
             }
-        }
-        .sheet(isPresented: $isMapExpanded) {
-            FullScreenMapView().environmentObject(analyzer)
-        }
-        .navigationDestination(for: LocationGroup.self) { city in
-            CityDetailView(city: city).environmentObject(analyzer)
-        }
-        .onAppear {
-            withAnimation(.spring(response: 0.55, dampingFraction: 0.75)) {
-                appeared = true
+            .navigationDestination(for: LocationGroup.self) { city in
+                CityDetailView(city: city).environmentObject(analyzer)
             }
-            if let first = sortedCities.first,
-               let asset = first.assets.first(where: { $0.latitude != nil }),
-               let lat = asset.latitude, let lon = asset.longitude {
-                withAnimation(.easeInOut(duration: 1.2)) {
-                    mapRegion = MKCoordinateRegion(
-                        center: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                        span: MKCoordinateSpan(latitudeDelta: 40.0, longitudeDelta: 40.0)
-                    )
-                }
+            .sheet(isPresented: $isMapExpanded) {
+                FullScreenMapView().environmentObject(analyzer)
+            }
+            .onAppear {
+                withAnimation { appeared = true }
+                fitMapToAllPins()
             }
         }
     }
 
-    // MARK: - Hero Map
-    private var heroMapSection: some View {
-        ZStack(alignment: .bottom) {
+    // MARK: - Map Card
+    private var mapCard: some View {
+        ZStack(alignment: .bottomTrailing) {
             Map(coordinateRegion: $mapRegion, annotationItems: locationMarkers) { marker in
                 MapAnnotation(coordinate: marker.coordinate) {
-                    NavigationLink(value: analyzer.locationsBreakdown.first(where: { $0.name == marker.name })) {
-                        VlogMapPin(count: marker.count, name: marker.name)
+                    NavigationLink(value: allCities.first(where: { $0.name == marker.name })) {
+                        CompactMapPin(name: marker.name, count: marker.count)
                     }
                 }
             }
-            .frame(height: 240)
-            .ignoresSafeArea(edges: .top)
-
-            // Fade gradient at bottom of map
-            LinearGradient(
-                colors: [Color.clear, Color(UIColor.systemGroupedBackground)],
-                startPoint: .top,
-                endPoint: .bottom
+            .frame(height: 210)
+            .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(Color.black.opacity(0.06), lineWidth: 1)
             )
-            .frame(height: 60)
+            .shadow(color: .black.opacity(0.08), radius: 12, y: 6)
+
+            // Expand button
+            Button { isMapExpanded = true } label: {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.white)
+                    .padding(8)
+                    .background(Color.black.opacity(0.5))
+                    .clipShape(Circle())
+            }
+            .padding(10)
         }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
     }
 
-    // MARK: - Stats Row
+    // MARK: - Stats row
     private var statsRow: some View {
-        HStack(spacing: 12) {
-            StatPill(icon: "mappin.circle.fill", value: "\(sortedCities.count)", label: "Places")
-            StatPill(icon: "photo.fill", value: "\(sortedCities.reduce(0) { $0 + $1.count })", label: "Memories")
-            if let oldest = sortedCities.last?.assets.first?.creationDate {
-                StatPill(icon: "calendar", value: yearString(oldest), label: "Since")
+        HStack(spacing: 10) {
+            MiniStat(icon: "mappin.circle.fill", value: "\(filteredCities.count)", label: "Places")
+            MiniStat(icon: "photo.fill", value: "\(filteredCities.reduce(0){$0+$1.count})", label: "Photos")
+            if let oldest = allCities.last?.assets.first?.creationDate {
+                MiniStat(icon: "calendar", value: fmtYear(oldest), label: "Since")
+            }
+            if let newest = filteredCities.first?.assets.first?.creationDate {
+                MiniStat(icon: "clock.fill", value: fmtMonth(newest), label: "Latest")
             }
         }
     }
 
-    private func yearString(_ date: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "yyyy"; return f.string(from: date)
+    // MARK: - Year Picker
+    private var yearPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("YEAR")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 18)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    // "All" chip
+                    FilterChip(
+                        label: "All",
+                        isSelected: selectedYear == nil,
+                        action: { withAnimation(.spring(response: 0.3)) { selectedYear = nil; selectedMonth = nil } }
+                    )
+                    ForEach(availableYears, id: \.self) { year in
+                        FilterChip(
+                            label: "\(year)",
+                            isSelected: selectedYear == year,
+                            action: {
+                                withAnimation(.spring(response: 0.3)) {
+                                    selectedYear = selectedYear == year ? nil : year
+                                    selectedMonth = nil
+                                }
+                                fitMapToFilter()
+                            }
+                        )
+                    }
+                }
+                .padding(.horizontal, 18)
+            }
+        }
     }
 
-    // MARK: - Location Markers
+    // MARK: - Month Chips
+    private var monthChips: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("MONTH")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 18)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    FilterChip(
+                        label: "All months",
+                        isSelected: selectedMonth == nil,
+                        action: { withAnimation(.spring(response: 0.3)) { selectedMonth = nil } }
+                    )
+                    ForEach(availableMonths, id: \.self) { month in
+                        FilterChip(
+                            label: monthName(month),
+                            isSelected: selectedMonth == month,
+                            action: {
+                                withAnimation(.spring(response: 0.3)) {
+                                    selectedMonth = selectedMonth == month ? nil : month
+                                }
+                            }
+                        )
+                    }
+                }
+                .padding(.horizontal, 18)
+            }
+        }
+    }
+
+    // MARK: - Helpers
+    private func monthName(_ m: Int) -> String {
+        let f = DateFormatter()
+        return f.standaloneMonthSymbols[m - 1]
+    }
+
     private var locationMarkers: [LocationMarker] {
-        sortedCities.compactMap { group in
+        (filteredCities.isEmpty ? allCities : filteredCities).compactMap { group in
             guard let asset = group.assets.first(where: { $0.latitude != nil && $0.longitude != nil }),
                   let lat = asset.latitude, let lon = asset.longitude else { return nil }
             return LocationMarker(
@@ -158,271 +364,329 @@ struct TravelVlogView: View {
             )
         }
     }
+
+    private func fitMapToAllPins() {
+        let markers = locationMarkers
+        guard !markers.isEmpty else { return }
+        if markers.count == 1 {
+            mapRegion = MKCoordinateRegion(center: markers[0].coordinate,
+                                           span: MKCoordinateSpan(latitudeDelta: 5, longitudeDelta: 5))
+            return
+        }
+        let lats = markers.map(\.coordinate.latitude)
+        let lons = markers.map(\.coordinate.longitude)
+        let minLat = lats.min()!, maxLat = lats.max()!
+        let minLon = lons.min()!, maxLon = lons.max()!
+        let center = CLLocationCoordinate2D(latitude: (minLat+maxLat)/2, longitude: (minLon+maxLon)/2)
+        let span = MKCoordinateSpan(
+            latitudeDelta: max((maxLat - minLat) * 1.5, 5),
+            longitudeDelta: max((maxLon - minLon) * 1.5, 5)
+        )
+        withAnimation(.easeInOut(duration: 0.8)) { mapRegion = MKCoordinateRegion(center: center, span: span) }
+    }
+
+    private func fitMapToFilter() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { fitMapToAllPins() }
+    }
+}
+
+// MARK: - Month Section Header
+struct MonthSectionHeader: View {
+    let label: String
+    var body: some View {
+        HStack {
+            Text(label)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary)
+            Rectangle()
+                .fill(Color.secondary.opacity(0.2))
+                .frame(height: 1)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .background(Color(UIColor.systemGroupedBackground))
+    }
+}
+
+// MARK: - Filter Chip
+struct FilterChip: View {
+    let label: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 13, weight: isSelected ? .bold : .medium))
+                .foregroundColor(isSelected ? .white : .primary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    isSelected
+                    ? Color.purple
+                    : Color(UIColor.secondarySystemGroupedBackground)
+                )
+                .clipShape(Capsule())
+                .overlay(
+                    Capsule().stroke(isSelected ? Color.clear : Color.black.opacity(0.08), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Mini Stat
+struct MiniStat: View {
+    let icon: String
+    let value: String
+    let label: String
+    var body: some View {
+        VStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.purple)
+            Text(value)
+                .font(.system(size: 13, weight: .bold, design: .rounded))
+                .foregroundColor(.primary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.7)
+            Text(label)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(.secondary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 10)
+        .background(Color(UIColor.secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+// MARK: - Compact Map Pin
+struct CompactMapPin: View {
+    let name: String
+    let count: Int
+    @State private var isPressed = false
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                Circle()
+                    .fill(LinearGradient(colors: [.purple, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 30, height: 30)
+                    .shadow(color: .purple.opacity(0.4), radius: 4, y: 2)
+                Image(systemName: "camera.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.white)
+            }
+
+            // Arrow tip
+            Path { path in
+                path.move(to: CGPoint(x: 0, y: 0))
+                path.addLine(to: CGPoint(x: 6, y: 7))
+                path.addLine(to: CGPoint(x: 12, y: 0))
+                path.closeSubpath()
+            }
+            .fill(Color.indigo)
+            .frame(width: 12, height: 7)
+            .offset(y: -1)
+
+            Text(name.components(separatedBy: ",").first ?? name)
+                .font(.system(size: 8, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(Color.black.opacity(0.55))
+                .clipShape(Capsule())
+        }
+        .scaleEffect(isPressed ? 1.15 : 1.0)
+        .animation(.spring(response: 0.2), value: isPressed)
+    }
 }
 
 // MARK: - Trip Card
 struct TripCard: View {
     let city: LocationGroup
-    let index: Int
     let isLast: Bool
     let appeared: Bool
 
-    private var date: Date? { city.assets.first?.creationDate }
-
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
-            // Timeline spine
+            // Spine
             VStack(spacing: 0) {
                 Circle()
-                    .fill(index == 0 ? Color.purple : Color.purple.opacity(0.4))
-                    .frame(width: 12, height: 12)
-                    .overlay(
-                        Circle().stroke(Color.white, lineWidth: 2)
-                            .shadow(color: .purple.opacity(0.3), radius: 3)
-                    )
-                    .padding(.top, 22)
-
+                    .fill(Color.purple)
+                    .frame(width: 10, height: 10)
+                    .overlay(Circle().stroke(Color.white, lineWidth: 2))
+                    .shadow(color: .purple.opacity(0.3), radius: 3)
+                    .padding(.top, 20)
                 if !isLast {
                     Rectangle()
-                        .fill(Color.purple.opacity(0.18))
+                        .fill(LinearGradient(colors: [Color.purple.opacity(0.3), Color.purple.opacity(0.05)],
+                                             startPoint: .top, endPoint: .bottom))
                         .frame(width: 2)
                         .frame(maxHeight: .infinity)
                 }
             }
-            .frame(width: 28)
+            .frame(width: 24)
 
-            // Card body
+            // Card
             NavigationLink(value: city) {
                 VStack(alignment: .leading, spacing: 0) {
-                    // Photo strip
-                    if !city.assets.isEmpty {
-                        photoStrip
-                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                            .overlay(
-                                // date badge top-left
-                                dateBadge
-                                    .padding(8),
-                                alignment: .topLeading
-                            )
-                    }
-
-                    // Text content
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(city.name)
-                            .font(.system(.subheadline, design: .rounded, weight: .bold))
-                            .foregroundColor(.primary)
-                            .lineLimit(1)
-
-                        HStack(spacing: 10) {
-                            Label("\(city.count)", systemImage: "photo.fill")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.purple)
-
-                            Label(formatSize(city.size), systemImage: "internaldrive.fill")
-                                .font(.system(size: 11, weight: .medium))
-                                .foregroundColor(.secondary)
-
-                            Spacer()
-
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundColor(.secondary.opacity(0.5))
+                    // Photo strip — 4 cells max
+                    PhotoStrip(assets: Array(city.assets.prefix(4)), overflow: max(0, city.assets.count - 4))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .overlay(alignment: .topLeading) {
+                            if let d = city.assets.first?.creationDate {
+                                Text(fmtDay(d))
+                                    .font(.system(size: 9, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 7)
+                                    .padding(.vertical, 3)
+                                    .background(.ultraThinMaterial.opacity(0.85))
+                                    .clipShape(Capsule())
+                                    .padding(7)
+                            }
                         }
+
+                    // Text info
+                    HStack(spacing: 6) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(city.name)
+                                .font(.system(.subheadline, design: .rounded, weight: .bold))
+                                .foregroundColor(.primary)
+                                .lineLimit(1)
+                            HStack(spacing: 8) {
+                                Label("\(city.count)", systemImage: "photo")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.purple)
+                                let f = ByteCountFormatter()
+                                Text(f.string(fromByteCount: city.size))
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundColor(.secondary.opacity(0.4))
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
                 }
                 .background(Color(UIColor.secondarySystemGroupedBackground))
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .shadow(color: .black.opacity(0.05), radius: 8, x: 0, y: 4)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .shadow(color: .black.opacity(0.04), radius: 6, y: 3)
             }
             .buttonStyle(.plain)
             .padding(.leading, 12)
-            .padding(.bottom, isLast ? 0 : 16)
-            .offset(x: appeared ? 0 : 30)
-            .opacity(appeared ? 1 : 0)
+            .padding(.bottom, isLast ? 0 : 14)
         }
-    }
-
-    private var photoStrip: some View {
-        let assets = Array(city.assets.prefix(3))
-        return HStack(spacing: 2) {
-            ForEach(Array(assets.enumerated()), id: \.element.localIdentifier) { i, asset in
-                TripPhotoCell(identifier: asset.localIdentifier, flex: i == 0 ? 1.6 : 1.0)
-            }
-            if city.assets.count > 3 {
-                ZStack {
-                    TripPhotoCell(identifier: city.assets[3].localIdentifier, flex: 1.0)
-                    Color.black.opacity(0.45)
-                    Text("+\(city.assets.count - 3)")
-                        .font(.system(.subheadline, design: .rounded, weight: .bold))
-                        .foregroundColor(.white)
-                }
-            }
-        }
-        .frame(height: 110)
-    }
-
-    private var dateBadge: some View {
-        Group {
-            if let d = date {
-                Text(monthYear(d))
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(Color.black.opacity(0.45))
-                    .clipShape(Capsule())
-            }
-        }
-    }
-
-    private func monthYear(_ d: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "MMM yyyy"; return f.string(from: d)
-    }
-
-    private func formatSize(_ bytes: Int64) -> String {
-        let f = ByteCountFormatter(); f.countStyle = .binary; return f.string(fromByteCount: bytes)
     }
 }
 
-// MARK: - Trip Photo Cell (single cell in strip)
-struct TripPhotoCell: View {
+// MARK: - Photo Strip (replaces TripPhotoCell + GeometryReader)
+struct PhotoStrip: View {
+    let assets: [AnalyzedAsset]
+    let overflow: Int
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(Array(assets.enumerated()), id: \.element.localIdentifier) { i, asset in
+                if i == assets.count - 1 && overflow > 0 {
+                    OverflowCell(identifier: asset.localIdentifier, overflow: overflow)
+                } else {
+                    FastThumb(identifier: asset.localIdentifier, flex: i == 0 ? 1.7 : 1.0)
+                }
+            }
+        }
+        .frame(height: 108)
+    }
+}
+
+// MARK: - Fast Thumb (no GeometryReader, fixed size)
+struct FastThumb: View {
     let identifier: String
     let flex: Double
-    @State private var image: UIImage? = nil
+    @StateObject private var loader = CellImageLoader()
 
     var body: some View {
-        GeometryReader { geo in
+        Group {
+            if let img = loader.image {
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .clipped()
+            } else {
+                Rectangle()
+                    .fill(Color(UIColor.tertiarySystemFill))
+                    .overlay(
+                        Image(systemName: "photo")
+                            .foregroundColor(.secondary.opacity(0.3))
+                            .font(.system(size: 14))
+                    )
+            }
+        }
+        .aspectRatio(flex, contentMode: .fill)
+        .clipped()
+        .onAppear { loader.load(identifier: identifier) }
+        .onDisappear { loader.cancel() }
+    }
+}
+
+// MARK: - Overflow Cell (last cell with +N badge)
+struct OverflowCell: View {
+    let identifier: String
+    let overflow: Int
+    @StateObject private var loader = CellImageLoader()
+
+    var body: some View {
+        ZStack {
             Group {
-                if let img = image {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .clipped()
+                if let img = loader.image {
+                    Image(uiImage: img).resizable().scaledToFill().clipped()
                 } else {
-                    Rectangle()
-                        .fill(Color(UIColor.tertiarySystemFill))
-                        .overlay(Image(systemName: "photo").foregroundColor(.secondary.opacity(0.4)))
+                    Rectangle().fill(Color(UIColor.tertiarySystemFill))
                 }
             }
-        }
-        .aspectRatio(flex, contentMode: .fit)
-        .onAppear { load() }
-    }
-
-    private func load() {
-        guard image == nil else { return }
-        let results = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-        guard let asset = results.firstObject else { return }
-        let opts = PHImageRequestOptions()
-        opts.deliveryMode = .opportunistic
-        opts.isNetworkAccessAllowed = false
-        opts.isSynchronous = false
-        PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 200, height: 200), contentMode: .aspectFill, options: opts) { img, _ in
-            if let img { DispatchQueue.main.async { self.image = img } }
-        }
-    }
-}
-
-// MARK: - Vlog Map Pin (cleaner than default)
-struct VlogMapPin: View {
-    let count: Int
-    let name: String
-
-    var body: some View {
-        VStack(spacing: 2) {
-            ZStack {
-                Circle()
-                    .fill(Color.purple)
-                    .frame(width: 32, height: 32)
-                    .shadow(color: .purple.opacity(0.35), radius: 6, y: 3)
-                Image(systemName: "camera.fill")
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundColor(.white)
-            }
-            Image(systemName: "arrowtriangle.down.fill")
-                .font(.system(size: 6))
-                .foregroundColor(.purple)
-                .offset(y: -3)
-
-            Text(name.components(separatedBy: ",").first ?? name)
-                .font(.system(size: 9, weight: .semibold))
+            Color.black.opacity(0.42)
+            Text("+\(overflow)")
+                .font(.system(.subheadline, design: .rounded, weight: .bold))
                 .foregroundColor(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.black.opacity(0.5))
-                .clipShape(Capsule())
         }
+        .aspectRatio(1, contentMode: .fill)
+        .clipped()
+        .onAppear { loader.load(identifier: identifier) }
+        .onDisappear { loader.cancel() }
     }
 }
 
-// MARK: - Stat Pill
-struct StatPill: View {
-    let icon: String
-    let value: String
-    let label: String
-
-    var body: some View {
-        VStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundColor(.purple)
-            Text(value)
-                .font(.system(.headline, design: .rounded, weight: .bold))
-                .foregroundColor(.primary)
-            Text(label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 12)
-        .background(Color(UIColor.secondarySystemGroupedBackground))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-    }
-}
-
-// MARK: - City Detail View (when tapping a trip card)
+// MARK: - City Detail View
 struct CityDetailView: View {
     @EnvironmentObject var analyzer: PhotoAnalyzer
     let city: LocationGroup
     @State private var selectedAsset: AnalyzedAsset? = nil
 
-    private let columns = [
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2),
-        GridItem(.flexible(), spacing: 2)
-    ]
+    private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                // Header stats
-                HStack(spacing: 16) {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 14) {
                     Label("\(city.count) photos", systemImage: "photo.fill")
-                        .font(.caption)
-                        .foregroundColor(.purple)
-                    let f = ByteCountFormatter()
-                    let sizeStr = f.string(fromByteCount: city.size)
-                    Label(sizeStr, systemImage: "internaldrive.fill")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                        .font(.caption).foregroundColor(.purple)
+                    Label(ByteCountFormatter().string(fromByteCount: city.size), systemImage: "internaldrive.fill")
+                        .font(.caption).foregroundColor(.secondary)
                     Spacer()
-                    if let date = city.assets.first?.creationDate {
-                        let df = DateFormatter()
-                        let _ = { df.dateFormat = "MMM yyyy" }()
-                        Text(df.string(from: date))
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                    if let d = city.assets.first?.creationDate {
+                        Text(fmtMonth(d)).font(.caption).foregroundColor(.secondary)
                     }
                 }
                 .padding(.horizontal)
 
-                // Grid
                 LazyVGrid(columns: columns, spacing: 2) {
                     ForEach(city.assets) { asset in
-                        TripPhotoCell(identifier: asset.localIdentifier, flex: 1.0)
+                        FastThumb(identifier: asset.localIdentifier, flex: 1.0)
                             .aspectRatio(1, contentMode: .fit)
                             .onTapGesture { selectedAsset = asset }
                     }
@@ -438,5 +702,3 @@ struct CityDetailView: View {
         }
     }
 }
-
-
