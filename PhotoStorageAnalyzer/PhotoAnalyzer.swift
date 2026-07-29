@@ -38,7 +38,6 @@ public struct AnalyzedAsset: Identifiable, Hashable, Codable {
         PHAssetMediaType(rawValue: mediaTypeRaw) ?? .unknown
     }
     
-    // Explicit constructor
     public init(
         localIdentifier: String,
         fileName: String,
@@ -73,31 +72,22 @@ public struct AnalyzedAsset: Identifiable, Hashable, Codable {
 public struct DashboardStats {
     public var totalCount: Int = 0
     public var totalSize: Int64 = 0
-    
     public var imageCount: Int = 0
     public var imageSize: Int64 = 0
-    
     public var videoCount: Int = 0
     public var videoSize: Int64 = 0
-    
     public var screenshotCount: Int = 0
     public var screenshotSize: Int64 = 0
-    
     public var livePhotoCount: Int = 0
     public var livePhotoSize: Int64 = 0
-    
     public var localCount: Int = 0
     public var localSize: Int64 = 0
-    
-    public var cloudCount: Int = 0 // iCloud-only (offloaded)
+    public var cloudCount: Int = 0
     public var cloudSize: Int64 = 0
-    
     public var localSyncedCount: Int = 0
     public var localSyncedSize: Int64 = 0
-    
     public var deviceOnlyCount: Int = 0
     public var deviceOnlySize: Int64 = 0
-    
     public var iCloudPhotosCount: Int = 0
     public var iCloudPhotosSize: Int64 = 0
 }
@@ -114,10 +104,7 @@ public struct SimilarPhotoGroup: Identifiable, Hashable {
     public var id: String { keyAsset.localIdentifier }
     public let keyAsset: AnalyzedAsset
     public var assets: [AnalyzedAsset]
-    
-    public var totalSize: Int64 {
-        assets.reduce(0) { $0 + $1.fileSize }
-    }
+    public var totalSize: Int64 { assets.reduce(0) { $0 + $1.fileSize } }
 }
 
 public struct LocationGroup: Identifiable, Codable, Hashable {
@@ -127,6 +114,20 @@ public struct LocationGroup: Identifiable, Codable, Hashable {
     public let size: Int64
     public let assets: [AnalyzedAsset]
 }
+
+// MARK: - Fast geo-key (1 decimal = ~11km radius, groups nearby shots)
+@inline(__always)
+private func geoKey(_ lat: Double, _ lon: Double) -> String {
+    String(format: "%.2f,%.2f", lat, lon)
+}
+
+// MARK: - Shared formatters (creating DateFormatter is expensive)
+private let monthYearFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f
+}()
+
+// MARK: - Background serialized encoder queue
+private let cacheQueue = DispatchQueue(label: "com.photoscanner.cache", qos: .background)
 
 @MainActor
 public final class PhotoAnalyzer: NSObject, ObservableObject {
@@ -144,10 +145,16 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     @Published public var locationsBreakdown: [LocationGroup] = []
     
     private var scanTask: Task<Void, Never>?
-    private var locationCache: [String: String] = [:]
-    private var assetCache: [String: PHAsset] = [:]
+    private var locationCache: [String: String] = [:]          // geoKey → name
+    private var assetCache: [String: PHAsset] = [:]           // id → PHAsset
     private var inFlightGeocodes: Set<String> = []
+    private var geocodePendingKeys: [String] = []              // queue for rate-limited geocode
+    private var geocodeTimer: Timer?
+    private var statsDebounceTask: Task<Void, Never>?          // coalesces rapid stat recalcs
     
+    // Fast lookup: geoKey → all asset indices that share it
+    private var geoKeyToIndices: [String: [Int]] = [:]
+
     public override init() {
         super.init()
         self.loadAlbums()
@@ -156,9 +163,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         
         #if targetEnvironment(simulator)
         self.authorizationStatus = .authorized
-        if self.analyzedAssets.isEmpty {
-            self.startDemoMode()
-        }
+        if self.analyzedAssets.isEmpty { self.startDemoMode() }
         #else
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         self.authorizationStatus = status
@@ -168,12 +173,11 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     
     deinit {
         PHPhotoLibrary.shared().unregisterChangeObserver(self)
+        geocodeTimer?.invalidate()
     }
     
     public func getPHAsset(for identifier: String) -> PHAsset? {
-        if let cached = assetCache[identifier] {
-            return cached
-        }
+        if let cached = assetCache[identifier] { return cached }
         #if !targetEnvironment(simulator)
         let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
         if let first = result.firstObject {
@@ -187,25 +191,25 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     public func requestPermission() async {
         let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
         self.authorizationStatus = status
-        if status == .authorized || status == .limited {
-            await startScan()
-        }
+        if status == .authorized || status == .limited { await startScan() }
     }
     
-    // Caching layer
+    // MARK: - Cache I/O (background thread)
     private func loadCache() {
-        if let data = UserDefaults.standard.data(forKey: "cached_analyzed_assets"),
-           let decoded = try? JSONDecoder().decode([AnalyzedAsset].self, from: data) {
-            self.analyzedAssets = decoded
-            self.totalScanned = decoded.count
-            self.totalAssetsCount = decoded.count
-            self.calculateStats()
-        }
+        guard let data = UserDefaults.standard.data(forKey: "cached_analyzed_assets"),
+              let decoded = try? JSONDecoder().decode([AnalyzedAsset].self, from: data) else { return }
+        self.analyzedAssets = decoded
+        self.totalScanned = decoded.count
+        self.totalAssetsCount = decoded.count
+        self.calculateStatsBackground()  // non-blocking
     }
     
     private func saveCache() {
-        if let encoded = try? JSONEncoder().encode(self.analyzedAssets) {
-            UserDefaults.standard.set(encoded, forKey: "cached_analyzed_assets")
+        let snapshot = self.analyzedAssets
+        cacheQueue.async {
+            if let encoded = try? JSONEncoder().encode(snapshot) {
+                UserDefaults.standard.set(encoded, forKey: "cached_analyzed_assets")
+            }
         }
     }
     
@@ -216,9 +220,11 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     }
     
     private func saveLocationCache() {
-        UserDefaults.standard.set(self.locationCache, forKey: "geocoded_locations_cache")
+        let snapshot = self.locationCache
+        cacheQueue.async { UserDefaults.standard.set(snapshot, forKey: "geocoded_locations_cache") }
     }
     
+    // MARK: - Core Scan  ────────────────────────────────────────────────────
     public func startScan() async {
         if isScanning { return }
         isScanning = true
@@ -226,7 +232,10 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         isDemoMode = false
         
         scanTask = Task {
+            // ── 1. Fetch all asset identifiers & metadata (fast, no I/O) ──
             let fetchOptions = PHFetchOptions()
+            fetchOptions.includeAllBurstAssets = false  // skip burst duplicates
+            fetchOptions.includeHiddenAssets = false
             let fetchResult = PHAsset.fetchAssets(with: fetchOptions)
             let count = fetchResult.count
             self.totalAssetsCount = count
@@ -242,132 +251,369 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             
             if count == 0 {
                 self.analyzedAssets = []
-                self.calculateStats()
-                self.saveCache()
                 self.isScanning = false
+                self.calculateStatsBackground()
+                self.saveCache()
                 return
             }
             
-            // Build cache map of PHAssets quickly in background
-            let assetsArray: [PHAsset] = (0..<count).map { fetchResult.object(at: $0) }
-            for asset in assetsArray {
+            // ── 2. Build PHAsset array off-main via nonisolated task ──────
+            // PHFetchResult is not Sendable, so extract synchronously but fast
+            var assetsArray: [PHAsset] = []
+            assetsArray.reserveCapacity(count)
+            fetchResult.enumerateObjects { asset, _, _ in
+                assetsArray.append(asset)
                 self.assetCache[asset.localIdentifier] = asset
             }
             
-            let currentIds = Set(assetsArray.map { $0.localIdentifier })
-            
-            // Incremental Scan: filter out any cached assets that have been deleted
+            // ── 3. Incremental diff: only process truly new assets ────────
+            let currentIds: Set<String> = Set(assetsArray.map(\.localIdentifier))
             var updatedAssets = self.analyzedAssets.filter { currentIds.contains($0.localIdentifier) }
-            let scannedIds = Set(updatedAssets.map { $0.localIdentifier })
+            let scannedIds: Set<String> = Set(updatedAssets.map(\.localIdentifier))
+            let newAssets = assetsArray.filter { !scannedIds.contains($0.localIdentifier) }
             
-            // Identify newly added assets
-            let newAssetsToScan = assetsArray.filter { !scannedIds.contains($0.localIdentifier) }
-            
-            if newAssetsToScan.isEmpty && updatedAssets.count == count {
-                // Library matches cache perfectly, stop early
-                self.analyzedAssets = updatedAssets.sorted(by: { $0.fileSize > $1.fileSize })
+            if newAssets.isEmpty && updatedAssets.count == count {
+                // Perfect cache hit — instant return, no blocking stats
+                self.analyzedAssets = updatedAssets
                 self.totalScanned = updatedAssets.count
-                self.calculateStats()
-                self.saveCache()
+                self.scanProgress = 1.0
                 self.isScanning = false
+                self.calculateStatsBackground()
                 return
             }
             
-            // Scan only the new assets in batches
-            var tempNewAssets: [AnalyzedAsset] = []
-            let newCount = newAssetsToScan.count
-            let batchSize = 30
+            // Show cached data immediately so UI isn't empty
+            if !updatedAssets.isEmpty {
+                self.analyzedAssets = updatedAssets
+                self.totalScanned = updatedAssets.count
+                self.scanProgress = 0.01  // 1% — scanning is starting
+            }
             
-            for i in stride(from: 0, to: newCount, by: batchSize) {
+            // ── 4. Parallel batch scan with large batches ─────────────────
+            let newCount = newAssets.count
+            let batchSize = 200   // 200 vs 30 = 6.7× fewer round-trips
+            let locationCacheSnapshot = self.locationCache
+            var tempNewAssets: [AnalyzedAsset] = []
+            tempNewAssets.reserveCapacity(newCount)
+            
+            for batchStart in stride(from: 0, to: newCount, by: batchSize) {
                 if Task.isCancelled { break }
+                let batchEnd = min(batchStart + batchSize, newCount)
+                let batch = Array(newAssets[batchStart..<batchEnd])
                 
-                let end = min(i + batchSize, newCount)
-                let batch = Array(newAssetsToScan[i..<end])
-                
-                let cacheSnapshot = self.locationCache
-                let batchResults = await withTaskGroup(of: AnalyzedAsset?.self) { group in
+                // Process batch concurrently — PHAssetResource reads are I/O but non-blocking
+                let batchResults: [AnalyzedAsset] = await withTaskGroup(of: AnalyzedAsset.self) { group in
                     for asset in batch {
                         group.addTask {
-                            let resources = PHAssetResource.assetResources(for: asset)
-                            guard let primaryResource = resources.first else {
-                                return AnalyzedAsset(
-                                    localIdentifier: asset.localIdentifier,
-                                    fileName: "Unknown",
-                                    fileSize: 0,
-                                    isLocallyAvailable: true,
-                                    mediaType: asset.mediaType,
-                                    isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
-                                    isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-                                    creationDate: asset.creationDate,
-                                    duration: asset.duration,
-                                    syncStatus: .deviceOnly,
-                                    locationName: nil,
-                                    latitude: nil,
-                                    longitude: nil
-                                )
-                            }
-                            
-                            let fileSize = primaryResource.value(forKey: "fileSize") as? Int64 ?? 0
-                            let isLocallyAvailable = primaryResource.value(forKey: "locallyAvailable") as? Bool ?? true
-                            let fileName = primaryResource.originalFilename
-                            
-                            let locName: String?
-                            if let loc = asset.location {
-                                let key = String(format: "%.2f,%.2f", loc.coordinate.latitude, loc.coordinate.longitude)
-                                locName = cacheSnapshot[key] ?? String(format: "Location (%.2f, %.2f)", loc.coordinate.latitude, loc.coordinate.longitude)
-                            } else {
-                                locName = nil
-                            }
-                            
-                            return AnalyzedAsset(
-                                localIdentifier: asset.localIdentifier,
-                                fileName: fileName,
-                                fileSize: fileSize,
-                                isLocallyAvailable: isLocallyAvailable,
-                                mediaType: asset.mediaType,
-                                isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
-                                isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-                                creationDate: asset.creationDate,
-                                duration: asset.duration,
-                                syncStatus: isLocallyAvailable ? .syncedLocal : .offloaded,
-                                locationName: locName,
-                                latitude: asset.location?.coordinate.latitude,
-                                longitude: asset.location?.coordinate.longitude
-                            )
+                            self.analyzeAsset(asset, locationCacheSnapshot: locationCacheSnapshot)
                         }
                     }
-                    
-                    var results: [AnalyzedAsset] = []
-                    for await assetInfo in group {
-                        if let info = assetInfo {
-                            results.append(info)
-                        }
-                    }
-                    return results
+                    var out: [AnalyzedAsset] = []
+                    out.reserveCapacity(batch.count)
+                    for await result in group { out.append(result) }
+                    return out
                 }
                 
                 tempNewAssets.append(contentsOf: batchResults)
                 
-                // Update progress dynamically
-                let currentProgressCount = updatedAssets.count + tempNewAssets.count
-                self.totalScanned = currentProgressCount
-                self.scanProgress = Double(currentProgressCount) / Double(count)
+                // Progress tracks only the NEW assets (0%→99%), never shows 100% until done
+                let newDone = tempNewAssets.count
+                self.totalScanned = updatedAssets.count + newDone
+                self.scanProgress = min(0.99, Double(newDone) / Double(max(newCount, 1)))
+                
+                // Progressive display every 1000 new assets
+                if tempNewAssets.count % 1000 == 0 || tempNewAssets.count == newCount {
+                    var partial = updatedAssets
+                    partial.append(contentsOf: tempNewAssets)
+                    self.analyzedAssets = partial
+                }
             }
             
             if !Task.isCancelled {
                 updatedAssets.append(contentsOf: tempNewAssets)
-                self.analyzedAssets = updatedAssets.sorted(by: { $0.fileSize > $1.fileSize })
-                self.calculateStats()
-                self.saveCache()
+                self.analyzedAssets = updatedAssets
+                self.totalScanned = updatedAssets.count
             }
+            
+            // Mark scan done FIRST, then run heavy stats in background
+            self.scanProgress = 1.0
             self.isScanning = false
+            self.saveCache()
+            self.calculateStatsBackground()
+            self.kickoffGeocoding()
         }
     }
     
+    // MARK: - Per-asset extraction (nonisolated, pure — no actor captures)
+    private nonisolated func analyzeAsset(_ asset: PHAsset, locationCacheSnapshot: [String: String]) -> AnalyzedAsset {
+        let resources = PHAssetResource.assetResources(for: asset)
+        let primary = resources.first
+        let fileSize = primary?.value(forKey: "fileSize") as? Int64 ?? 0
+        let isLocal  = primary?.value(forKey: "locallyAvailable") as? Bool ?? true
+        let fileName = primary?.originalFilename ?? "Unknown"
+        
+        var locName: String? = nil
+        var lat: Double? = nil
+        var lon: Double? = nil
+        if let loc = asset.location {
+            lat = loc.coordinate.latitude
+            lon = loc.coordinate.longitude
+            let key = geoKey(loc.coordinate.latitude, loc.coordinate.longitude)
+            locName = locationCacheSnapshot[key]
+            // Don't fallback to "Location(lat,lon)" — leave nil, geocoder will fill it
+        }
+        
+        return AnalyzedAsset(
+            localIdentifier: asset.localIdentifier,
+            fileName: fileName,
+            fileSize: fileSize,
+            isLocallyAvailable: isLocal,
+            mediaType: asset.mediaType,
+            isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
+            isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
+            creationDate: asset.creationDate,
+            duration: asset.duration,
+            syncStatus: isLocal ? .syncedLocal : .offloaded,
+            locationName: locName,
+            latitude: lat,
+            longitude: lon
+        )
+    }
+    
+    // MARK: - Stats — runs on a detached background task to not block main thread
+    public func calculateStats() { calculateStatsBackground() }
+    
+    private func calculateStatsBackground() {
+        let snapshot = self.analyzedAssets
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            let result = await self.computeStats(snapshot)
+            await MainActor.run {
+                self.stats = result.stats
+                self.similarPhotosGroups = result.similar
+                self.monthlyBreakdown = result.monthly
+                // Locations breakdown is recalculated on main actor (needs locationCache)
+                self.calculateLocationsBreakdownFast()
+            }
+        }
+    }
+    
+    // Pure computation — runs off main thread
+    private nonisolated func computeStats(_ assets: [AnalyzedAsset]) async
+        -> (stats: DashboardStats, similar: [SimilarPhotoGroup], monthly: [MonthStats]) {
+        var s = DashboardStats()
+        s.totalCount = assets.count
+        for a in assets {
+            s.totalSize += a.fileSize
+            switch a.mediaType {
+            case .image:
+                s.imageCount += 1; s.imageSize += a.fileSize
+                if a.isScreenshot { s.screenshotCount += 1; s.screenshotSize += a.fileSize }
+                if a.isLivePhoto  { s.livePhotoCount  += 1; s.livePhotoSize  += a.fileSize }
+            case .video:
+                s.videoCount += 1; s.videoSize += a.fileSize
+            default: break
+            }
+            if a.isLocallyAvailable { s.localCount += 1; s.localSize += a.fileSize }
+            else                    { s.cloudCount += 1; s.cloudSize += a.fileSize }
+            switch a.syncStatus {
+            case .deviceOnly:  s.deviceOnlyCount  += 1; s.deviceOnlySize  += a.fileSize
+            case .syncedLocal: s.localSyncedCount += 1; s.localSyncedSize += a.fileSize
+            case .offloaded:   break
+            }
+            if a.syncStatus == .syncedLocal || a.syncStatus == .offloaded {
+                s.iCloudPhotosCount += 1; s.iCloudPhotosSize += a.fileSize
+            }
+        }
+        let similar = computeSimilar(assets)
+        let monthly = computeMonthly(assets)
+        return (s, similar, monthly)
+    }
+    
+    private nonisolated func computeSimilar(_ assets: [AnalyzedAsset]) -> [SimilarPhotoGroup] {
+        let sorted = assets
+            .filter { $0.creationDate != nil && $0.fileSize > 0 }
+            .sorted { $0.creationDate! < $1.creationDate! }
+        var groups: [SimilarPhotoGroup] = []
+        guard !sorted.isEmpty else { return groups }
+        var groupStart = 0
+        for i in 1...sorted.count {
+            let isEnd = (i == sorted.count)
+            let gap = isEnd ? 6.0 : sorted[i].creationDate!.timeIntervalSince(sorted[i-1].creationDate!)
+            if gap > 5.0 || isEnd {
+                if i - groupStart >= 2 {
+                    let slice = Array(sorted[groupStart..<i])
+                    groups.append(SimilarPhotoGroup(keyAsset: slice[0], assets: slice))
+                }
+                groupStart = i
+            }
+        }
+        return groups.sorted { $0.totalSize > $1.totalSize }
+    }
+    
+    private nonisolated func computeMonthly(_ assets: [AnalyzedAsset]) -> [MonthStats] {
+        let fmt = DateFormatter(); fmt.dateFormat = "MMMM yyyy"
+        var countMap: [String: Int]   = [:]
+        var sizeMap:  [String: Int64] = [:]
+        var dateMap:  [String: Date]  = [:]
+        for a in assets {
+            guard let d = a.creationDate else { continue }
+            let key = fmt.string(from: d)
+            countMap[key, default: 0]  += 1
+            sizeMap[key, default: 0]   += a.fileSize
+            if dateMap[key] == nil { dateMap[key] = d }
+        }
+        return countMap.map {
+            MonthStats(name: $0.key, count: $0.value, size: sizeMap[$0.key]!, date: dateMap[$0.key]!)
+        }.sorted { $0.date > $1.date }
+    }
+    
+    // Kept for compatibility — delegates to background variant
+    private func calculateStatsImmediate() { calculateStatsBackground() }
+    
+    // MARK: - Locations breakdown  O(n) dict grouping ─────────────────────
+    private func calculateLocationsBreakdownFast() {
+        var groups:   [String: [AnalyzedAsset]] = [:]
+        var keyToCoord: [String: (Double, Double)] = [:]
+        
+        for a in analyzedAssets {
+            guard let lat = a.latitude, let lon = a.longitude else { continue }
+            let key = geoKey(lat, lon)
+            groups[key, default: []].append(a)
+            if keyToCoord[key] == nil { keyToCoord[key] = (lat, lon) }
+        }
+        
+        // Rebuild geoKey index for O(1) geocode updates
+        geoKeyToIndices = [:]
+        for (i, a) in analyzedAssets.enumerated() {
+            guard let lat = a.latitude, let lon = a.longitude else { continue }
+            let key = geoKey(lat, lon)
+            geoKeyToIndices[key, default: []].append(i)
+        }
+        
+        var tempGroups: [LocationGroup] = []
+        var keysNeedingGeocode: [String] = []
+        
+        for (key, assets) in groups {
+            let name = locationCache[key]  // nil if not geocoded yet
+            let displayName = name ?? "Exploring…"
+            tempGroups.append(LocationGroup(
+                name: displayName,
+                count: assets.count,
+                size: assets.reduce(0) { $0 + $1.fileSize },
+                assets: assets
+            ))
+            if name == nil && !inFlightGeocodes.contains(key) {
+                keysNeedingGeocode.append(key)
+            }
+        }
+        
+        self.locationsBreakdown = tempGroups.sorted {
+            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
+        }
+        
+        // Enqueue new geocode keys (rate-limited)
+        if !keysNeedingGeocode.isEmpty {
+            geocodePendingKeys.append(contentsOf: keysNeedingGeocode)
+            startGeocodingQueue()
+        }
+    }
+    
+    // MARK: - Rate-limited geocoding queue (Apple allows ~50 geocodes/min) ─
+    private func kickoffGeocoding() {
+        startGeocodingQueue()
+    }
+    
+    private func startGeocodingQueue() {
+        guard geocodeTimer == nil else { return }
+        // Fire every 1.3s — stays comfortably under Apple's 50/min rate limit
+        geocodeTimer = Timer.scheduledTimer(withTimeInterval: 1.3, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard let key = self.geocodePendingKeys.first else {
+                    self.geocodeTimer?.invalidate()
+                    self.geocodeTimer = nil
+                    return
+                }
+                self.geocodePendingKeys.removeFirst()
+                self.geocodeOneKey(key)
+            }
+        }
+    }
+    
+    private func geocodeOneKey(_ key: String) {
+        guard !inFlightGeocodes.contains(key) else { return }
+        let parts = key.split(separator: ",")
+        guard parts.count == 2,
+              let lat = Double(parts[0]),
+              let lon = Double(parts[1]) else { return }
+        
+        inFlightGeocodes.insert(key)
+        let location = CLLocation(latitude: lat, longitude: lon)
+        
+        CLGeocoder().reverseGeocodeLocation(location) { [weak self] placemarks, _ in
+            guard let self else { return }
+            let city = placemarks?.first.flatMap {
+                $0.locality ?? $0.subAdministrativeArea ?? $0.administrativeArea ?? $0.name
+            } ?? key
+            let country = placemarks?.first?.country ?? ""
+            let name = country.isEmpty ? city : "\(city), \(country)"
+            
+            DispatchQueue.main.async {
+                self.inFlightGeocodes.remove(key)
+                guard self.locationCache[key] != name else { return } // no-op if same
+                self.locationCache[key] = name
+                self.saveLocationCache()
+                
+                // O(1) update using pre-built index — no O(n) loop
+                if let indices = self.geoKeyToIndices[key] {
+                    for idx in indices where idx < self.analyzedAssets.count {
+                        var a = self.analyzedAssets[idx]
+                        a = AnalyzedAsset(
+                            localIdentifier: a.localIdentifier, fileName: a.fileName,
+                            fileSize: a.fileSize, isLocallyAvailable: a.isLocallyAvailable,
+                            mediaType: a.mediaType, isScreenshot: a.isScreenshot,
+                            isLivePhoto: a.isLivePhoto, creationDate: a.creationDate,
+                            duration: a.duration, syncStatus: a.syncStatus,
+                            locationName: name, latitude: a.latitude, longitude: a.longitude
+                        )
+                        self.analyzedAssets[idx] = a
+                    }
+                }
+                
+                // Refresh only locations breakdown (not full recalc)
+                self.refreshLocationsBreakdownOnly()
+            }
+        }
+    }
+    
+    // Lightweight re-build of just locationsBreakdown (skips similar/monthly recalc)
+    private func refreshLocationsBreakdownOnly() {
+        var groups: [String: [AnalyzedAsset]] = [:]
+        for a in analyzedAssets {
+            guard let lat = a.latitude, let lon = a.longitude else { continue }
+            groups[geoKey(lat, lon), default: []].append(a)
+        }
+        var tempGroups: [LocationGroup] = []
+        for (key, assets) in groups {
+            let name = locationCache[key] ?? "Exploring…"
+            tempGroups.append(LocationGroup(
+                name: name,
+                count: assets.count,
+                size: assets.reduce(0) { $0 + $1.fileSize },
+                assets: assets
+            ))
+        }
+        self.locationsBreakdown = tempGroups.sorted {
+            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
+        }
+        self.saveCache()
+    }
+    
+    // MARK: - Demo mode
     public func startDemoMode() {
         isScanning = true
         scanProgress = 0.0
-        
         Task {
             try? await Task.sleep(nanoseconds: 500_000_000)
             self.generateMockAssets()
@@ -377,288 +623,68 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     
     private func generateMockAssets() {
         self.isDemoMode = true
-        
         let baseDate = Date()
         let mockFiles: [(String, Int, Bool, PHAssetMediaType, Bool, Bool, Date, TimeInterval, iCloudSyncStatus, String?, Double?, Double?)] = [
-            ("IMG_0982_RAW.DNG", 42_500_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 1), 0.0, .syncedLocal, "New York, USA", 40.7128, -74.0060),
-            ("REC_TRIP_4K.MOV", 1_280_000_000, true, PHAssetMediaType.video, false, false, baseDate.addingTimeInterval(-86400 * 2), 242.0, .syncedLocal, "Paris, France", 48.8566, 2.3522),
-            ("SCREENSHOT_HOMESCREEN.PNG", 4_200_000, true, PHAssetMediaType.image, true, false, baseDate.addingTimeInterval(-86400 * 3), 0.0, .deviceOnly, nil, nil, nil),
-            ("PORTRAIT_SHOT_1.HEIC", 3_400_000, false, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 4), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
-            
-            // Similar Photo Group 1 (Burst/Duplicates)
-            ("IMG_BURST_1.HEIC", 8_500_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 5 + 0.0), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
-            ("IMG_BURST_2.HEIC", 8_400_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 5 + 1.5), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
-            ("IMG_BURST_3.HEIC", 8_600_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 5 + 3.0), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
-            
-            ("LIVE_ACTION_JUMP.HEIC", 8_900_000, false, PHAssetMediaType.image, false, true, baseDate.addingTimeInterval(-86400 * 6), 0.0, .offloaded, "Grand Canyon, AZ", 36.0544, -112.1401),
-            ("SLOW_MO_SURFING.MOV", 620_000_000, false, PHAssetMediaType.video, false, false, baseDate.addingTimeInterval(-86400 * 7), 55.0, .offloaded, "Hawaii, USA", 20.7984, -156.3319),
-            
-            // Similar Photo Group 2
-            ("IMG_SCENIC_A.HEIC", 15_200_000, false, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 8 + 0.0), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
-            ("IMG_SCENIC_B.HEIC", 15_100_000, false, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 8 + 2.0), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
-            
-            ("MEME_COMIC.JPG", 1_800_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 9), 0.0, .deviceOnly, nil, nil, nil),
-            ("RECEIPT_SCAN.PNG", 2_100_000, true, PHAssetMediaType.image, true, false, baseDate.addingTimeInterval(-86400 * 10), 0.0, .deviceOnly, nil, nil, nil),
-            ("IMG_1820.HEIC", 2_900_000, true, PHAssetMediaType.image, false, false, baseDate.addingTimeInterval(-86400 * 11), 0.0, .syncedLocal, "New York, USA", 40.7128, -74.0060),
-            ("SHORT_CLIP.MP4", 32_000_000, true, PHAssetMediaType.video, false, false, baseDate.addingTimeInterval(-86400 * 12), 12.0, .syncedLocal, "Paris, France", 48.8566, 2.3522)
+            ("IMG_0982_RAW.DNG", 42_500_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*1), 0.0, .syncedLocal, "New York, USA", 40.7128, -74.0060),
+            ("REC_TRIP_4K.MOV", 1_280_000_000, true, .video, false, false, baseDate.addingTimeInterval(-86400*2), 242.0, .syncedLocal, "Paris, France", 48.8566, 2.3522),
+            ("SCREENSHOT_HOMESCREEN.PNG", 4_200_000, true, .image, true, false, baseDate.addingTimeInterval(-86400*3), 0.0, .deviceOnly, nil, nil, nil),
+            ("PORTRAIT_SHOT_1.HEIC", 3_400_000, false, .image, false, false, baseDate.addingTimeInterval(-86400*4), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
+            ("IMG_BURST_1.HEIC", 8_500_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*5+0.0), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
+            ("IMG_BURST_2.HEIC", 8_400_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*5+1.5), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
+            ("IMG_BURST_3.HEIC", 8_600_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*5+3.0), 0.0, .syncedLocal, "San Francisco, USA", 37.7749, -122.4194),
+            ("LIVE_ACTION_JUMP.HEIC", 8_900_000, false, .image, false, true, baseDate.addingTimeInterval(-86400*6), 0.0, .offloaded, "Grand Canyon Village, AZ", 36.0544, -112.1401),
+            ("SLOW_MO_SURFING.MOV", 620_000_000, false, .video, false, false, baseDate.addingTimeInterval(-86400*7), 55.0, .offloaded, "Hawaii, USA", 20.7984, -156.3319),
+            ("IMG_SCENIC_A.HEIC", 15_200_000, false, .image, false, false, baseDate.addingTimeInterval(-86400*8+0.0), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
+            ("IMG_SCENIC_B.HEIC", 15_100_000, false, .image, false, false, baseDate.addingTimeInterval(-86400*8+2.0), 0.0, .offloaded, "Tokyo, Japan", 35.6762, 139.6503),
+            ("MEME_COMIC.JPG", 1_800_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*9), 0.0, .deviceOnly, nil, nil, nil),
+            ("RECEIPT_SCAN.PNG", 2_100_000, true, .image, true, false, baseDate.addingTimeInterval(-86400*10), 0.0, .deviceOnly, nil, nil, nil),
+            ("IMG_1820.HEIC", 2_900_000, true, .image, false, false, baseDate.addingTimeInterval(-86400*11), 0.0, .syncedLocal, "New York, USA", 40.7128, -74.0060),
+            ("SHORT_CLIP.MP4", 32_000_000, true, .video, false, false, baseDate.addingTimeInterval(-86400*12), 12.0, .syncedLocal, "Paris, France", 48.8566, 2.3522)
         ]
-        
         var tempAssets: [AnalyzedAsset] = []
         for (name, size, local, type, screenshot, live, date, duration, sync, locName, lat, lon) in mockFiles {
-            let mockAsset = AnalyzedAsset(
+            tempAssets.append(AnalyzedAsset(
                 localIdentifier: "mock_\(name)_\(UUID().uuidString)",
-                fileName: name,
-                fileSize: Int64(size),
-                isLocallyAvailable: local,
-                mediaType: type,
-                isScreenshot: screenshot,
-                isLivePhoto: live,
-                creationDate: date,
-                duration: duration,
-                syncStatus: sync,
-                locationName: locName,
-                latitude: lat,
-                longitude: lon
-            )
-            tempAssets.append(mockAsset)
+                fileName: name, fileSize: Int64(size), isLocallyAvailable: local,
+                mediaType: type, isScreenshot: screenshot, isLivePhoto: live,
+                creationDate: date, duration: duration, syncStatus: sync,
+                locationName: locName, latitude: lat, longitude: lon
+            ))
         }
-        
-        self.analyzedAssets = tempAssets.sorted(by: { $0.fileSize > $1.fileSize })
+        self.analyzedAssets = tempAssets.sorted { $0.fileSize > $1.fileSize }
         self.totalScanned = tempAssets.count
         self.totalAssetsCount = tempAssets.count
-        self.calculateStats()
+        self.calculateStatsImmediate()
         self.authorizationStatus = .authorized
     }
     
-    public func calculateStats() {
-        var tempStats = DashboardStats()
-        tempStats.totalCount = analyzedAssets.count
-        
-        for asset in analyzedAssets {
-            tempStats.totalSize += asset.fileSize
-            
-            if asset.mediaType == .image {
-                tempStats.imageCount += 1
-                tempStats.imageSize += asset.fileSize
-                
-                if asset.isScreenshot {
-                    tempStats.screenshotCount += 1
-                    tempStats.screenshotSize += asset.fileSize
-                }
-                
-                if asset.isLivePhoto {
-                    tempStats.livePhotoCount += 1
-                    tempStats.livePhotoSize += asset.fileSize
-                }
-            } else if asset.mediaType == .video {
-                tempStats.videoCount += 1
-                tempStats.videoSize += asset.fileSize
-            }
-            
-            if asset.isLocallyAvailable {
-                tempStats.localCount += 1
-                tempStats.localSize += asset.fileSize
-            } else {
-                tempStats.cloudCount += 1
-                tempStats.cloudSize += asset.fileSize
-            }
-            
-            switch asset.syncStatus {
-            case .deviceOnly:
-                tempStats.deviceOnlyCount += 1
-                tempStats.deviceOnlySize += asset.fileSize
-            case .syncedLocal:
-                tempStats.localSyncedCount += 1
-                tempStats.localSyncedSize += asset.fileSize
-            case .offloaded:
-                break
-            }
-            
-            if asset.syncStatus == .syncedLocal || asset.syncStatus == .offloaded {
-                tempStats.iCloudPhotosCount += 1
-                tempStats.iCloudPhotosSize += asset.fileSize
-            }
-        }
-        
-        self.stats = tempStats
-        self.calculateSimilarPhotos()
-        self.calculateMonthlyBreakdown()
-        self.calculateLocationsBreakdown()
-    }
-    
-    private func calculateLocationsBreakdown() {
-        var coordinateGroups: [String: [AnalyzedAsset]] = [:]
-        for asset in analyzedAssets {
-            guard let lat = asset.latitude, let lon = asset.longitude else { continue }
-            let key = String(format: "%.2f,%.2f", lat, lon)
-            coordinateGroups[key, default: []].append(asset)
-        }
-        
-        var tempGroups: [LocationGroup] = []
-        for (coordinateKey, assets) in coordinateGroups {
-            let name = self.locationCache[coordinateKey] ?? "Location (\(coordinateKey))"
-            
-            let group = LocationGroup(
-                name: name,
-                count: assets.count,
-                size: assets.reduce(0) { $0 + $1.fileSize },
-                assets: assets
-            )
-            tempGroups.append(group)
-            
-            if self.locationCache[coordinateKey] == nil && !self.inFlightGeocodes.contains(coordinateKey) {
-                self.inFlightGeocodes.insert(coordinateKey)
-                geocodeCoordinateKey(coordinateKey, assets: assets)
-            }
-        }
-        
-        // Sort chronologically by trip date (latest trip first)
-        self.locationsBreakdown = tempGroups.sorted(by: {
-            ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date())
-        })
-    }
-    
-    private func geocodeCoordinateKey(_ key: String, assets: [AnalyzedAsset]) {
-        guard let first = assets.first,
-              let lat = first.latitude,
-              let lon = first.longitude else { return }
-        
-        let location = CLLocation(latitude: lat, longitude: lon)
-        CLGeocoder().reverseGeocodeLocation(location) { placemarks, error in
-            guard let placemark = placemarks?.first else {
-                DispatchQueue.main.async {
-                    self.inFlightGeocodes.remove(key)
-                }
-                return
-            }
-            
-            // Check granular fields: locality (city), subAdmin (county), admin (state), landmark name
-            let city = placemark.locality ?? placemark.subAdministrativeArea ?? placemark.administrativeArea ?? placemark.name ?? "Unknown Location"
-            let country = placemark.country ?? ""
-            let name = country.isEmpty ? city : "\(city), \(country)"
-            
-            DispatchQueue.main.async {
-                self.inFlightGeocodes.remove(key)
-                self.locationCache[key] = name
-                self.saveLocationCache()
-                
-                var updated = self.analyzedAssets
-                for i in 0..<updated.count {
-                    if let aLat = updated[i].latitude, let aLon = updated[i].longitude {
-                        let aKey = String(format: "%.2f,%.2f", aLat, aLon)
-                        if aKey == key {
-                            updated[i] = AnalyzedAsset(
-                                localIdentifier: updated[i].localIdentifier,
-                                fileName: updated[i].fileName,
-                                fileSize: updated[i].fileSize,
-                                isLocallyAvailable: updated[i].isLocallyAvailable,
-                                mediaType: updated[i].mediaType,
-                                isScreenshot: updated[i].isScreenshot,
-                                isLivePhoto: updated[i].isLivePhoto,
-                                creationDate: updated[i].creationDate,
-                                duration: updated[i].duration,
-                                syncStatus: updated[i].syncStatus,
-                                locationName: name,
-                                latitude: aLat,
-                                longitude: aLon
-                            )
-                        }
-                    }
-                }
-                self.analyzedAssets = updated
-                self.calculateStats()
-                self.saveCache()
-            }
-        }
-    }
-    
-    private func calculateSimilarPhotos() {
-        let sortedByDate = analyzedAssets.filter { $0.creationDate != nil }.sorted(by: { $0.creationDate! < $1.creationDate! })
-        
-        var groups: [SimilarPhotoGroup] = []
-        var currentGroupAssets: [AnalyzedAsset] = []
-        
-        for asset in sortedByDate {
-            if currentGroupAssets.isEmpty {
-                currentGroupAssets.append(asset)
-            } else {
-                let lastAsset = currentGroupAssets.last!
-                let timeDelta = asset.creationDate!.timeIntervalSince(lastAsset.creationDate!)
-                
-                if timeDelta <= 5.0 {
-                    currentGroupAssets.append(asset)
-                } else {
-                    if currentGroupAssets.count >= 2 {
-                        groups.append(SimilarPhotoGroup(keyAsset: currentGroupAssets.first!, assets: currentGroupAssets))
-                    }
-                    currentGroupAssets = [asset]
-                }
-            }
-        }
-        
-        if currentGroupAssets.count >= 2 {
-            groups.append(SimilarPhotoGroup(keyAsset: currentGroupAssets.first!, assets: currentGroupAssets))
-        }
-        
-        self.similarPhotosGroups = groups.sorted(by: { $0.totalSize > $1.totalSize })
-    }
-    
-    private func calculateMonthlyBreakdown() {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMMM yyyy"
-        
-        var groups: [String: [AnalyzedAsset]] = [:]
-        for asset in analyzedAssets {
-            guard let date = asset.creationDate else { continue }
-            let monthString = formatter.string(from: date)
-            groups[monthString, default: []].append(asset)
-        }
-        
-        var breakdown: [MonthStats] = []
-        for (monthName, assets) in groups {
-            let totalSize = assets.reduce(0) { $0 + $1.fileSize }
-            breakdown.append(MonthStats(name: monthName, count: assets.count, size: totalSize, date: assets.first?.creationDate ?? Date()))
-        }
-        
-        self.monthlyBreakdown = breakdown.sorted(by: { $0.date > $1.date })
-    }
-    
+    // MARK: - Delete
     public func deleteAssets(_ assetsToDelete: [AnalyzedAsset]) async -> Bool {
         #if targetEnvironment(simulator)
-        let deletedIDs = Set(assetsToDelete.map { $0.localIdentifier })
-        DispatchQueue.main.async {
-            self.analyzedAssets.removeAll(where: { deletedIDs.contains($0.localIdentifier) })
-            self.calculateStats()
-            self.saveCache()
-        }
+        let deletedIDs = Set(assetsToDelete.map(\.localIdentifier))
+        self.analyzedAssets.removeAll { deletedIDs.contains($0.localIdentifier) }
+        self.calculateStatsImmediate()
+        self.saveCache()
         return true
         #else
-        let localIDs = assetsToDelete.map { $0.localIdentifier }
+        let localIDs = assetsToDelete.map(\.localIdentifier)
         let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: localIDs, options: nil)
         var realAssets: [PHAsset] = []
-        fetchResult.enumerateObjects { asset, _, _ in
-            realAssets.append(asset)
-        }
-        
-        if realAssets.isEmpty {
-            return false
-        }
-        
+        fetchResult.enumerateObjects { asset, _, _ in realAssets.append(asset) }
+        guard !realAssets.isEmpty else { return false }
         let deletedIDs = Set(localIDs)
-        
         return await withCheckedContinuation { continuation in
             PHPhotoLibrary.shared().performChanges({
                 PHAssetChangeRequest.deleteAssets(realAssets as NSArray)
             }) { success, error in
                 if success {
                     DispatchQueue.main.async {
-                        self.analyzedAssets.removeAll(where: { deletedIDs.contains($0.localIdentifier) })
-                        self.calculateStats()
+                        self.analyzedAssets.removeAll { deletedIDs.contains($0.localIdentifier) }
+                        self.calculateStatsImmediate()
                         self.saveCache()
                         continuation.resume(returning: true)
                     }
                 } else {
-                    print("Error deleting assets: \(String(describing: error))")
                     continuation.resume(returning: false)
                 }
             }
@@ -666,7 +692,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         #endif
     }
     
-    // MARK: - Custom Albums & Favorites
+    // MARK: - Custom Albums
     public func saveAlbums() {
         if let encoded = try? JSONEncoder().encode(customAlbums) {
             UserDefaults.standard.set(encoded, forKey: "custom_albums")
@@ -678,15 +704,12 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
            let decoded = try? JSONDecoder().decode([CustomAlbum].self, from: data) {
             self.customAlbums = decoded
         } else {
-            self.customAlbums = [
-                CustomAlbum(id: UUID(), name: "Favorites", assetIdentifiers: [])
-            ]
+            self.customAlbums = [CustomAlbum(id: UUID(), name: "Favorites", assetIdentifiers: [])]
         }
     }
     
     public func createAlbum(name: String) {
-        let newAlbum = CustomAlbum(id: UUID(), name: name, assetIdentifiers: [])
-        customAlbums.append(newAlbum)
+        customAlbums.append(CustomAlbum(id: UUID(), name: name, assetIdentifiers: []))
         saveAlbums()
     }
     
@@ -710,35 +733,17 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     }
     
     public func getLocationName(for asset: AnalyzedAsset, completion: @escaping (String) -> Void) {
-        if let preDefined = asset.locationName {
-            completion(preDefined)
-            return
-        }
-        guard let lat = asset.latitude, let lon = asset.longitude else {
-            completion("No Location")
-            return
-        }
-        let cacheKey = String(format: "%.3f,%.3f", lat, lon)
-        if let cached = locationCache[cacheKey] {
-            completion(cached)
-            return
-        }
-        
+        if let pre = asset.locationName { completion(pre); return }
+        guard let lat = asset.latitude, let lon = asset.longitude else { completion("No Location"); return }
+        let key = geoKey(lat, lon)
+        if let cached = locationCache[key] { completion(cached); return }
         let location = CLLocation(latitude: lat, longitude: lon)
-        CLGeocoder().reverseGeocodeLocation(location) { placemarks, error in
-            if let placemark = placemarks?.first,
-               let city = placemark.locality,
-               let country = placemark.country {
+        CLGeocoder().reverseGeocodeLocation(location) { placemarks, _ in
+            if let p = placemarks?.first, let city = p.locality, let country = p.country {
                 let name = "\(city), \(country)"
-                DispatchQueue.main.async {
-                    self.locationCache[cacheKey] = name
-                    completion(name)
-                }
+                DispatchQueue.main.async { self.locationCache[key] = name; completion(name) }
             } else {
-                let fallback = String(format: "Lat: %.2f, Lon: %.2f", lat, lon)
-                DispatchQueue.main.async {
-                    completion(fallback)
-                }
+                completion(String(format: "%.2f, %.2f", lat, lon))
             }
         }
     }
@@ -748,9 +753,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
 extension PhotoAnalyzer: PHPhotoLibraryChangeObserver {
     nonisolated public func photoLibraryDidChange(_ changeInstance: PHChange) {
         Task { @MainActor in
-            if !self.isScanning && !self.isDemoMode {
-                await self.startScan()
-            }
+            if !self.isScanning && !self.isDemoMode { await self.startScan() }
         }
     }
 }
