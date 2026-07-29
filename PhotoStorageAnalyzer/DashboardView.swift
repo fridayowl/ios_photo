@@ -60,6 +60,11 @@ struct DashboardView: View {
                     // iCloud Status Card
                     iCloudStatusCard
                     
+                    // Travel Vlog Slide Card
+                    if !analyzer.locationsBreakdown.isEmpty {
+                        travelVlogSlideCard
+                    }
+                    
                     // Recommendations for cleanup
                     cleanupRecommendationsCard
                     
@@ -501,5 +506,130 @@ struct QuickActionButton: View {
             )
             .shadow(color: .black.opacity(0.02), radius: 6, y: 3)
         }
+    }
+}
+
+// MARK: - DASHBOARD TIMELINE THUMBNAIL (For Vlog Banner Card)
+struct DashboardTimelineThumbnailView: View {
+    @EnvironmentObject var analyzer: PhotoAnalyzer
+    let assetIdentifier: String
+    @State private var image: UIImage? = nil
+    
+    var body: some View {
+        Group {
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.purple.opacity(0.1)
+                    .overlay(
+                        Image(systemName: "photo")
+                            .foregroundColor(.purple)
+                    )
+            }
+        }
+        .onAppear {
+            loadThumbnail()
+        }
+    }
+    
+    private func loadThumbnail() {
+        guard let asset = analyzer.getPHAsset(for: assetIdentifier) else { return }
+        let manager = PHImageManager.default()
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .fastFormat
+        options.isSynchronous = false
+        manager.requestImage(
+            for: asset,
+            targetSize: CGSize(width: 120, height: 120),
+            contentMode: .aspectFill,
+            options: options
+        ) { result, _ in
+            if let result = result {
+                self.image = result
+            }
+        }
+    }
+}
+
+extension DashboardView {
+    private func formatMonthYear(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM yyyy"
+        return formatter.string(from: date)
+    }
+
+    var travelVlogSlideCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("🗺️ TRAVEL FOOTPRINTS")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundColor(.purple)
+                Spacer()
+                Text("Latest Vlog")
+                    .font(.caption2)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.purple.opacity(0.12))
+                    .cornerRadius(6)
+                    .foregroundColor(.purple)
+            }
+            
+            if let latestCity = analyzer.locationsBreakdown.sorted(by: { ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date()) }).first {
+                HStack(spacing: 12) {
+                    if let firstAsset = latestCity.assets.first {
+                        DashboardTimelineThumbnailView(assetIdentifier: firstAsset.localIdentifier)
+                            .frame(width: 60, height: 60)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                    
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(latestCity.name)
+                            .font(.headline)
+                            .fontWeight(.bold)
+                            .foregroundColor(.primary)
+                        
+                        HStack {
+                            Text("\(latestCity.count) memories")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if let date = latestCity.assets.first?.creationDate {
+                                Text("•")
+                                    .foregroundColor(.secondary)
+                                Text(formatMonthYear(date))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    Spacer()
+                }
+            }
+            
+            Button(action: {
+                selectedTab = 1 // Switch to Gallery
+            }) {
+                Text("Open Travel Vlog Timeline")
+                    .font(.subheadline)
+                    .fontWeight(.bold)
+                    .foregroundColor(.white)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(Color.purple)
+                    .cornerRadius(12)
+            }
+        }
+        .padding(20)
+        .background(
+            RoundedRectangle(cornerRadius: 20)
+                .fill(Color.cardBg)
+                .shadow(color: .black.opacity(0.03), radius: 10, y: 5)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 20)
+                .stroke(Color.borderLight, lineWidth: 1)
+        )
     }
 }

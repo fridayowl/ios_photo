@@ -509,7 +509,11 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
                 geocodeCoordinateKey(coordinateKey, assets: assets)
             }
         }
-        self.locationsBreakdown = tempGroups.sorted(by: { $0.size > $1.size })
+        
+        // Sort chronologically by trip date (latest trip first)
+        self.locationsBreakdown = tempGroups.sorted(by: {
+            ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date())
+        })
     }
     
     private func geocodeCoordinateKey(_ key: String, assets: [AnalyzedAsset]) {
@@ -519,11 +523,13 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         
         let location = CLLocation(latitude: lat, longitude: lon)
         CLGeocoder().reverseGeocodeLocation(location) { placemarks, error in
-            guard let placemark = placemarks?.first,
-                  let city = placemark.locality,
-                  let country = placemark.country else { return }
+            guard let placemark = placemarks?.first else { return }
             
-            let name = "\(city), \(country)"
+            // Check granular fields: locality (city), subAdmin (county), admin (state), landmark name
+            let city = placemark.locality ?? placemark.subAdministrativeArea ?? placemark.administrativeArea ?? placemark.name ?? "Unknown Location"
+            let country = placemark.country ?? ""
+            let name = country.isEmpty ? city : "\(city), \(country)"
+            
             DispatchQueue.main.async {
                 self.locationCache[key] = name
                 self.saveLocationCache()

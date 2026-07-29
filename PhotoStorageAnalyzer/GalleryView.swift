@@ -35,6 +35,10 @@ struct GalleryView: View {
     @State private var sharingItems: [Any]? = nil
     @State private var isPreparingShare = false
     @State private var isMapExpanded = false
+    @State private var mapRegion = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0),
+        span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
+    )
     
     @Namespace private var tabAnimation
     
@@ -515,10 +519,7 @@ extension GalleryView {
             VStack(alignment: .leading, spacing: 20) {
                 // Interactive Custom Pin Map View
                 ZStack(alignment: .topTrailing) {
-                    Map(coordinateRegion: .constant(MKCoordinateRegion(
-                        center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0), // Center globally
-                        span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
-                    )), annotationItems: locationMarkers) { marker in
+                    Map(coordinateRegion: $mapRegion, annotationItems: locationMarkers) { marker in
                         MapAnnotation(coordinate: marker.coordinate) {
                             NavigationLink {
                                 if let cityGroup = analyzer.locationsBreakdown.first(where: { $0.name == marker.name }) {
@@ -535,6 +536,14 @@ extension GalleryView {
                         RoundedRectangle(cornerRadius: 16)
                             .stroke(Color.borderLight, lineWidth: 1)
                     )
+                    .onAppear {
+                        if let first = locationMarkers.first {
+                            mapRegion = MKCoordinateRegion(
+                                center: first.coordinate,
+                                span: MKCoordinateSpan(latitudeDelta: 30.0, longitudeDelta: 30.0)
+                            )
+                        }
+                    }
                     
                     // Expand Map Button
                     Button(action: {
