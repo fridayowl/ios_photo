@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var analyzer: PhotoAnalyzer
     @State private var selectedTab = 0
     @State private var selectedFilter: AppFilter = .all
+    @State private var spinAngle: Double = 0
     
     var body: some View {
         Group {
@@ -14,8 +15,12 @@ struct ContentView: View {
             case .denied, .restricted:
                 permissionDeniedView
             case .authorized, .limited:
-                if analyzer.isScanning && analyzer.analyzedAssets.isEmpty {
+                if analyzer.analyzedAssets.isEmpty {
+                    // Show scanning/loading screen until we have data (first launch or cache miss)
                     scanningView
+                        .onAppear {
+                            Task { await analyzer.startScan() }
+                        }
                 } else {
                     mainAppView
                 }
@@ -23,8 +28,8 @@ struct ContentView: View {
                 welcomeView
             }
         }
-        .animation(.easeInOut, value: analyzer.authorizationStatus)
-        .animation(.easeInOut, value: analyzer.isScanning)
+        .animation(.easeInOut(duration: 0.3), value: analyzer.authorizationStatus.rawValue)
+        .animation(.easeInOut(duration: 0.3), value: analyzer.analyzedAssets.isEmpty)
         .task {
             if analyzer.authorizationStatus == .authorized || analyzer.authorizationStatus == .limited {
                 await analyzer.startScan()
@@ -174,49 +179,88 @@ struct ContentView: View {
         ZStack {
             Color.mainBg.ignoresSafeArea()
             
-            VStack(spacing: 30) {
+            VStack(spacing: 32) {
                 Spacer()
                 
-                // Pulsing circular progress ring
+                // Icon + pulse ring
                 ZStack {
+                    // Outer pulsing glow
                     Circle()
-                        .stroke(Color.purple.opacity(0.08), lineWidth: 10)
-                        .frame(width: 140, height: 140)
+                        .fill(Color.purple.opacity(0.08))
+                        .frame(width: 160, height: 160)
                     
+                    // Track ring
                     Circle()
-                        .trim(from: 0.0, to: CGFloat(analyzer.scanProgress))
-                        .stroke(
-                            LinearGradient(
-                                colors: [.purple, .blue],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            style: StrokeStyle(lineWidth: 10, lineCap: .round)
-                        )
-                        .frame(width: 140, height: 140)
-                        .rotationEffect(.degrees(-90))
-                        .animation(.spring(response: 0.45, dampingFraction: 0.8), value: analyzer.scanProgress)
+                        .stroke(Color.purple.opacity(0.1), lineWidth: 10)
+                        .frame(width: 130, height: 130)
                     
-                    VStack(spacing: 2) {
-                        Text(String(format: "%.0f%%", analyzer.scanProgress * 100))
-                            .font(.system(size: 26, weight: .bold, design: .rounded))
-                            .foregroundColor(.primary)
-                        Text("\(analyzer.totalScanned) / \(analyzer.totalAssetsCount)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
+                    // Progress arc (or animated spinner if progress = 0)
+                    if analyzer.scanProgress > 0 {
+                        Circle()
+                            .trim(from: 0.0, to: CGFloat(analyzer.scanProgress))
+                            .stroke(
+                                LinearGradient(
+                                    colors: [.purple, .blue],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                style: StrokeStyle(lineWidth: 10, lineCap: .round)
+                            )
+                            .frame(width: 130, height: 130)
+                            .rotationEffect(.degrees(-90))
+                            .animation(.spring(response: 0.45, dampingFraction: 0.8), value: analyzer.scanProgress)
+                    } else {
+                        // Indeterminate spinner while waiting to start
+                        Circle()
+                            .trim(from: 0.0, to: 0.25)
+                            .stroke(
+                                LinearGradient(
+                                    colors: [.purple, .blue],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                ),
+                                style: StrokeStyle(lineWidth: 10, lineCap: .round)
+                            )
+                            .frame(width: 130, height: 130)
+                            .rotationEffect(.degrees(spinAngle))
+                            .onAppear {
+                                withAnimation(.linear(duration: 1.0).repeatForever(autoreverses: false)) {
+                                    spinAngle = 360
+                                }
+                            }
+                    }
+                    
+                    // Center content
+                    VStack(spacing: 4) {
+                        if analyzer.scanProgress > 0 {
+                            Text(String(format: "%.0f%%", analyzer.scanProgress * 100))
+                                .font(.system(size: 26, weight: .bold, design: .rounded))
+                                .foregroundColor(.primary)
+                            Text("\(analyzer.totalScanned) / \(analyzer.totalAssetsCount)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        } else {
+                            Image(systemName: "photo.stack.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(
+                                    LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                )
+                        }
                     }
                 }
                 
-                VStack(spacing: 12) {
-                    Text("Analyzing Photo Library")
-                        .font(.system(.headline, design: .rounded))
+                VStack(spacing: 10) {
+                    Text(analyzer.scanProgress > 0 ? "Analyzing Photo Library" : "Loading…")
+                        .font(.system(.title3, design: .rounded, weight: .bold))
                         .foregroundColor(.primary)
                     
-                    Text("Reading file metadata, matching duplicates, and calculating iCloud sync states...")
-                        .font(.caption)
+                    Text(analyzer.scanProgress > 0
+                         ? "Reading file metadata, matching duplicates, and calculating iCloud sync states…"
+                         : "Preparing to scan your photo library")
+                        .font(.footnote)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                        .padding(.horizontal, 40)
+                        .padding(.horizontal, 48)
                 }
                 
                 Spacer()
