@@ -16,11 +16,13 @@
 		8B81047A21368AECD210DFA2 /* PhotoStorageAnalyzerApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 447C49805AA1F24212D27139 /* PhotoStorageAnalyzerApp.swift */; };
 		AC186CA49FE1964F69CF63CA /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A9B30F00F36E3723E01C07F /* ContentView.swift */; };
 		B0F53C88104D0C7C2FBCE394 /* GalleryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 409E9EC4CFD3AB292EB7B99F /* GalleryView.swift */; };
+		A1B2C3D4E5F60002 /* TravelVlogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F60001 /* TravelVlogView.swift */; };
 		E5D2940B50ECAD423C6ECD4D /* StorageInsightsSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 69F2FA353FD57BE2BFC86ABB /* StorageInsightsSheet.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		409E9EC4CFD3AB292EB7B99F /* GalleryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GalleryView.swift; sourceTree = "<group>"; };
+		A1B2C3D4E5F60001 /* TravelVlogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TravelVlogView.swift; sourceTree = "<group>"; };
 		447C49805AA1F24212D27139 /* PhotoStorageAnalyzerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoStorageAnalyzerApp.swift; sourceTree = "<group>"; };
 		53C74B51B86F80CD5A4B4DEC /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
 		5DFE7C83BCFF6267BCE5D27B /* PhotoListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoListView.swift; sourceTree = "<group>"; };
@@ -58,6 +60,7 @@
 				9A9B30F00F36E3723E01C07F /* ContentView.swift */,
 				53C74B51B86F80CD5A4B4DEC /* DashboardView.swift */,
 				409E9EC4CFD3AB292EB7B99F /* GalleryView.swift */,
+				A1B2C3D4E5F60001 /* TravelVlogView.swift */,
 				A1D6657D480B8BD4B26CC750 /* Info.plist */,
 				ED1FDC77CE7378B02111A076 /* PhotoAnalyzer.swift */,
 				81BDC978917877EF79990C7A /* PhotoDetailView.swift */,
@@ -136,6 +139,7 @@
 				AC186CA49FE1964F69CF63CA /* ContentView.swift in Sources */,
 				35CC1FFCA84A3046AC605797 /* DashboardView.swift in Sources */,
 				B0F53C88104D0C7C2FBCE394 /* GalleryView.swift in Sources */,
+				A1B2C3D4E5F60002 /* TravelVlogView.swift in Sources */,
 				53548F672C9D7541C8765F94 /* PhotoAnalyzer.swift in Sources */,
 				60F9576A29404C716D984218 /* PhotoDetailView.swift in Sources */,
 				3C800DC4B8CC0CF0FFF6B17B /* PhotoListView.swift in Sources */,

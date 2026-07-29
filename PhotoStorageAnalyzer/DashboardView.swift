@@ -34,11 +34,6 @@ struct DashboardView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 20) {
-                    // Travel Vlog Slide Card
-                    if !analyzer.locationsBreakdown.isEmpty {
-                        travelVlogSlideCard
-                    }
-                    
                     // Header card with circular space summary
                     storageSummaryCard
                     

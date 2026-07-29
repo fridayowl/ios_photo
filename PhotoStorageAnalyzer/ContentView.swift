@@ -239,11 +239,17 @@ struct ContentView: View {
                 }
                 .tag(1)
             
+            TravelVlogView()
+                .tabItem {
+                    Label("Travel Vlog", systemImage: "map.fill")
+                }
+                .tag(2)
+            
             PhotoListView(selectedFilter: $selectedFilter)
                 .tabItem {
                     Label("Cleanup", systemImage: "trash.fill")
                 }
-                .tag(2)
+                .tag(3)
         }
         .tint(.purple)
         .preferredColorScheme(.light)
