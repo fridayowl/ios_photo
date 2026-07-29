@@ -618,142 +618,46 @@ extension GalleryView {
                     .padding(.horizontal)
                 }
                 
-                // 2. Travel Vlog Timeline (Vertical footprints diary style)
-                if !analyzer.locationsBreakdown.isEmpty {
-                    VStack(alignment: .leading, spacing: 14) {
-                        Text("🗺️ Travel Vlog Timeline")
-                            .font(.headline)
-                            .foregroundColor(.primary)
-                            .padding(.horizontal)
-                        
-                        VStack(spacing: 0) {
-                            let timelineCities = analyzer.locationsBreakdown.sorted {
-                                ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date())
-                            }
-                            
-                            ForEach(Array(timelineCities.enumerated()), id: \.element.name) { index, city in
-                                VStack(spacing: 0) {
-                                    HStack(alignment: .center, spacing: 12) {
-                                        // Vlog Photo Node
-                                        ZStack {
-                                            Circle()
-                                                .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
-                                                .frame(width: 52, height: 52)
-                                            
-                                            if let firstAsset = city.assets.first {
-                                                TimelineThumbnailView(assetIdentifier: firstAsset.localIdentifier)
-                                                    .frame(width: 46, height: 46)
-                                                    .clipShape(Circle())
-                                            } else {
-                                                Image(systemName: "airplane")
-                                                    .foregroundColor(.white)
-                                            }
-                                        }
-                                        
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            HStack(spacing: 4) {
-                                                Text(getTravelEmoji(for: index))
-                                                Text(city.name)
-                                                    .font(.system(.subheadline, design: .rounded))
-                                                    .fontWeight(.bold)
-                                                    .foregroundColor(.primary)
-                                            }
-                                            
-                                            HStack(spacing: 8) {
-                                                if let date = city.assets.first?.creationDate {
-                                                    Label(formatMonthYear(date), systemImage: "calendar")
-                                                        .font(.system(size: 9))
-                                                        .foregroundColor(.secondary)
-                                                }
-                                                
-                                                Label("\(city.count) memories", systemImage: "photo")
-                                                    .font(.system(size: 9))
-                                                    .foregroundColor(.purple)
-                                            }
-                                        }
-                                        
-                                        Spacer()
-                                        
-                                        NavigationLink {
-                                            cityGalleryView(cityName: city.name, assets: city.assets)
-                                        } label: {
-                                            Image(systemName: "chevron.right.circle.fill")
-                                                .font(.title2)
-                                                .foregroundColor(.purple)
-                                                .opacity(0.8)
-                                        }
-                                    }
-                                    .padding()
-                                    .background(Color.cardBg)
-                                    .cornerRadius(16)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 16)
-                                            .stroke(Color.borderLight, lineWidth: 1)
-                                    )
-                                    .shadow(color: Color.black.opacity(0.01), radius: 6, y: 3)
-                                    
-                                    // Dash footprint connector line below card
-                                    if index < timelineCities.count - 1 {
-                                        VStack(spacing: 4) {
-                                            ForEach(0..<3) { _ in
-                                                Circle()
-                                                    .fill(Color.purple.opacity(0.35))
-                                                    .frame(width: 4, height: 4)
-                                            }
-                                        }
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .padding(.leading, 42)
-                                        .padding(.vertical, 4)
-                                    }
-                                }
-                            }
-                        }
-                        .padding(.horizontal)
-                    }
-                }
-                
-                // 3. Location Lists Row
-                Text("Locations List")
-                    .font(.headline)
-                    .foregroundColor(.primary)
-                    .padding(.horizontal)
-                
-                VStack(alignment: .leading, spacing: 12) {
-                    ForEach(analyzer.locationsBreakdown) { city in
-                        NavigationLink {
-                            cityGalleryView(cityName: city.name, assets: city.assets)
-                        } label: {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(city.name)
-                                        .font(.subheadline)
-                                        .fontWeight(.bold)
-                                        .foregroundColor(.primary)
-                                    Text("\(city.count) items")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                                Spacer()
-                                Text(formatBytes(city.size))
-                                    .font(.system(.subheadline, design: .rounded))
-                                    .fontWeight(.bold)
-                                    .foregroundColor(.purple)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding()
-                            .background(Color.cardBg)
-                            .cornerRadius(12)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.borderLight, lineWidth: 1)
+                // "Open Travel Vlog" prompt card
+                NavigationLink {
+                    TravelVlogView().environmentObject(analyzer)
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "map.fill")
+                            .font(.title3)
+                            .foregroundColor(.white)
+                            .frame(width: 40, height: 40)
+                            .background(
+                                LinearGradient(colors: [.purple, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing)
                             )
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Travel Vlog")
+                                .font(.subheadline)
+                                .fontWeight(.bold)
+                                .foregroundColor(.primary)
+                            Text("View your full journey timeline")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
                         }
+                        
+                        Spacer()
+                        
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
+                    .padding(14)
+                    .background(Color.cardBg)
+                    .cornerRadius(14)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14)
+                            .stroke(Color.borderLight, lineWidth: 1)
+                    )
                 }
                 .padding(.horizontal)
-                .padding(.bottom, 20)
+                .padding(.bottom, 24)
             }
         }
         .sheet(isPresented: $isMapExpanded) {
