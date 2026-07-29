@@ -12,45 +12,77 @@ final class ThumbnailCache {
     func set(_ id: String, _ img: UIImage) { cache.setObject(img, forKey: id as NSString) }
 }
 
-// MARK: - Image loader (runs on background, no main thread block)
 @MainActor
 final class CellImageLoader: ObservableObject {
     @Published var image: UIImage?
     private var requestID: PHImageRequestID?
+    private var fetchTask: Task<Void, Never>?
 
     func load(identifier: String, size: CGFloat = 200) {
         if let cached = ThumbnailCache.shared.get(identifier) { image = cached; return }
-        let results = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
-        guard let asset = results.firstObject else { return }
+        
+        fetchTask?.cancel()
+        
+        if let cachedAsset = PhotoAnalyzer.shared?.getPHAsset(for: identifier) {
+            requestImage(for: cachedAsset, size: size, identifier: identifier)
+        } else {
+            fetchTask = Task {
+                let asset = await Task.detached(priority: .userInitiated) { () -> PHAsset? in
+                    guard !Task.isCancelled else { return nil }
+                    let results = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+                    return results.firstObject
+                }.value
+                
+                guard !Task.isCancelled, let asset = asset else { return }
+                requestImage(for: asset, size: size, identifier: identifier)
+            }
+        }
+    }
+
+    private func requestImage(for asset: PHAsset, size: CGFloat, identifier: String) {
         let opts = PHImageRequestOptions()
         opts.deliveryMode = .opportunistic
         opts.isNetworkAccessAllowed = false
         opts.isSynchronous = false
         opts.resizeMode = .fast
         let target = CGSize(width: size, height: size)
+        
         requestID = PHImageManager.default().requestImage(
             for: asset, targetSize: target, contentMode: .aspectFill, options: opts
         ) { [weak self] img, _ in
             guard let self, let img else { return }
             ThumbnailCache.shared.set(identifier, img)
-            DispatchQueue.main.async { self.image = img }
+            self.image = img
         }
     }
 
     func cancel() {
+        fetchTask?.cancel()
+        fetchTask = nil
         if let id = requestID { PHImageManager.default().cancelImageRequest(id); requestID = nil }
     }
 }
 
+// MARK: - Cached Formatters
+private let monthFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "MMM yyyy"; return f
+}()
+private let yearFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "yyyy"; return f
+}()
+private let dayFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateStyle = .medium; return f
+}()
+
 // MARK: - Helpers
 private func fmtMonth(_ d: Date) -> String {
-    let f = DateFormatter(); f.dateFormat = "MMM yyyy"; return f.string(from: d)
+    monthFormatter.string(from: d)
 }
 private func fmtYear(_ d: Date) -> String {
-    let f = DateFormatter(); f.dateFormat = "yyyy"; return f.string(from: d)
+    yearFormatter.string(from: d)
 }
 private func fmtDay(_ d: Date) -> String {
-    let f = DateFormatter(); f.dateStyle = .medium; return f.string(from: d)
+    dayFormatter.string(from: d)
 }
 
 // MARK: - Main TravelVlogView
@@ -67,53 +99,29 @@ struct TravelVlogView: View {
         span: MKCoordinateSpan(latitudeDelta: 100, longitudeDelta: 120)
     )
 
-    // Pre-computed
-    private var allCities: [LocationGroup] {
-        analyzer.locationsBreakdown.sorted {
-            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
-        }
-    }
+    // Asynchronous processed display data (avoids main-thread blocking)
+    @State private var displayedGroups: [(String, [LocationGroup])] = []
+    @State private var displayedCitiesCount = 0
+    @State private var displayedMarkers: [LocationMarker] = []
+    @State private var selectedCity: LocationGroup? = nil
+    @State private var showMap = false
+    @State private var isProcessing = true
 
     private var availableYears: [Int] {
         let cal = Calendar.current
-        let years = Set(allCities.compactMap { $0.assets.first?.creationDate }.map { cal.component(.year, from: $0) })
+        let years = Set(analyzer.locationsBreakdown.compactMap { $0.assets.first?.creationDate }.map { cal.component(.year, from: $0) })
         return years.sorted(by: >)
     }
 
     private var availableMonths: [Int] {
         guard let year = selectedYear else { return [] }
         let cal = Calendar.current
-        let months = Set(allCities.compactMap { city -> Int? in
+        let months = Set(analyzer.locationsBreakdown.compactMap { city -> Int? in
             guard let d = city.assets.first?.creationDate,
                   cal.component(.year, from: d) == year else { return nil }
             return cal.component(.month, from: d)
         })
         return months.sorted(by: >)
-    }
-
-    private var filteredCities: [LocationGroup] {
-        let cal = Calendar.current
-        return allCities.filter { city in
-            guard let d = city.assets.first?.creationDate else { return false }
-            let y = cal.component(.year, from: d)
-            let m = cal.component(.month, from: d)
-            if let sy = selectedYear, sy != y { return false }
-            if let sm = selectedMonth, sm != m { return false }
-            return true
-        }
-    }
-
-    // Group by year+month for section headers
-    private var groupedByMonth: [(String, [LocationGroup])] {
-        var groups: [String: [LocationGroup]] = [:]
-        var orderMap: [String: Date] = [:]
-        for city in filteredCities {
-            guard let d = city.assets.first?.creationDate else { continue }
-            let key = fmtMonth(d)
-            groups[key, default: []].append(city)
-            if orderMap[key] == nil { orderMap[key] = d }
-        }
-        return groups.sorted { (orderMap[$0.key] ?? .distantPast) > (orderMap[$1.key] ?? .distantPast) }
     }
 
     var body: some View {
@@ -122,89 +130,105 @@ struct TravelVlogView: View {
                 VStack(alignment: .leading, spacing: 0) {
 
                     // ── MAP ──────────────────────────────────────────────
-                    mapCard
-                        .opacity(appeared ? 1 : 0)
-                        .offset(y: appeared ? 0 : -12)
-                        .animation(.spring(response: 0.5, dampingFraction: 0.8), value: appeared)
-
-                    // ── STATS ────────────────────────────────────────────
-                    statsRow
-                        .padding(.horizontal, 16)
-                        .padding(.top, 14)
-                        .opacity(appeared ? 1 : 0)
-                        .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.08), value: appeared)
-
-                    // ── YEAR PICKER ──────────────────────────────────────
-                    yearPicker
-                        .padding(.top, 18)
-                        .opacity(appeared ? 1 : 0)
-                        .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.14), value: appeared)
-
-                    // ── MONTH CHIPS (only when year selected) ───────────
-                    if selectedYear != nil {
-                        monthChips
-                            .padding(.top, 10)
-                            .transition(.move(edge: .top).combined(with: .opacity))
-                    }
-
-                    // ── JOURNEY HEADER ───────────────────────────────────
-                    HStack(spacing: 8) {
-                        RoundedRectangle(cornerRadius: 2)
-                            .fill(Color.purple)
-                            .frame(width: 4, height: 20)
-                        Text(selectedYear == nil ? "All Journeys" : (selectedMonth == nil ? "Year \(selectedYear!)" : monthName(selectedMonth!)))
-                            .font(.system(.title3, design: .rounded, weight: .bold))
-                            .foregroundColor(.primary)
-                        Spacer()
-                        if filteredCities.count > 0 {
-                            Text("\(filteredCities.count) places")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 22)
-                    .padding(.bottom, 6)
-                    .opacity(appeared ? 1 : 0)
-                    .animation(.easeOut.delay(0.2), value: appeared)
-
-                    // ── TIMELINE ─────────────────────────────────────────
-                    if filteredCities.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: "mappin.slash")
-                                .font(.system(size: 40))
-                                .foregroundColor(.secondary.opacity(0.35))
-                            Text("No trips for this period")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 60)
+                    if isProcessing {
+                        SkeletonRect(height: 210, cornerRadius: 20)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 8)
                     } else {
-                        LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
-                            ForEach(groupedByMonth, id: \.0) { monthLabel, cities in
-                                Section {
-                                    ForEach(Array(cities.enumerated()), id: \.element.id) { idx, city in
-                                        TripCard(
-                                            city: city,
-                                            isLast: idx == cities.count - 1,
-                                            appeared: appeared
-                                        )
-                                        .padding(.horizontal, 18)
-                                        .opacity(appeared ? 1 : 0)
-                                        .offset(x: appeared ? 0 : 24)
-                                        .animation(
-                                            .spring(response: 0.55, dampingFraction: 0.78)
-                                                .delay(0.22 + Double(idx) * 0.06),
-                                            value: appeared
-                                        )
-                                    }
-                                } header: {
-                                    MonthSectionHeader(label: monthLabel)
-                                }
+                        if showMap {
+                            mapCard
+                                .opacity(appeared ? 1 : 0)
+                                .offset(y: appeared ? 0 : -12)
+                                .animation(.spring(response: 0.5, dampingFraction: 0.8), value: appeared)
+                                .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                        } else {
+                            showMapPlaceholder
+                        }
+                    }
+
+                    if isProcessing {
+                        TravelVlogSkeletonView()
+                            .padding(.top, 14)
+                    } else {
+                        // ── STATS ────────────────────────────────────────────
+                        statsRow
+                            .padding(.horizontal, 16)
+                            .padding(.top, 14)
+                            .opacity(appeared ? 1 : 0)
+                            .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.08), value: appeared)
+
+                        // ── YEAR PICKER ──────────────────────────────────────
+                        yearPicker
+                            .padding(.top, 18)
+                            .opacity(appeared ? 1 : 0)
+                            .animation(.spring(response: 0.5, dampingFraction: 0.8).delay(0.14), value: appeared)
+
+                        // ── MONTH CHIPS (only when year selected) ───────────
+                        if selectedYear != nil {
+                            monthChips
+                                .padding(.top, 10)
+                                .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+
+                        // ── JOURNEY HEADER ───────────────────────────────────
+                        HStack(spacing: 8) {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(Color.purple)
+                                .frame(width: 4, height: 20)
+                            Text(selectedYear == nil ? "All Journeys" : (selectedMonth == nil ? "Year \(selectedYear!)" : monthName(selectedMonth!)))
+                                .font(.system(.title3, design: .rounded, weight: .bold))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            if displayedCitiesCount > 0 {
+                                Text("\(displayedCitiesCount) places")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                             }
                         }
-                        .padding(.bottom, 32)
+                        .padding(.horizontal, 18)
+                        .padding(.top, 22)
+                        .padding(.bottom, 6)
+                        .opacity(appeared ? 1 : 0)
+                        .animation(.easeOut.delay(0.2), value: appeared)
+
+                        // ── TIMELINE ─────────────────────────────────────────
+                        if displayedGroups.isEmpty {
+                            VStack(spacing: 12) {
+                                Image(systemName: "mappin.slash")
+                                    .font(.system(size: 40))
+                                    .foregroundColor(.secondary.opacity(0.35))
+                                Text("No trips for this period")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 60)
+                        } else {
+                            LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                                ForEach(displayedGroups, id: \.0) { monthLabel, cities in
+                                    Section {
+                                        ForEach(Array(cities.enumerated()), id: \.element.id) { idx, city in
+                                            TripCard(
+                                                city: city,
+                                                isLast: idx == cities.count - 1,
+                                                appeared: appeared
+                                            )
+                                            .padding(.horizontal, 18)
+                                            .opacity(appeared ? 1 : 0)
+                                            .offset(x: appeared ? 0 : 24)
+                                            .animation(
+                                                .spring(response: 0.55, dampingFraction: 0.78)
+                                                    .delay(0.22 + Double(idx) * 0.06),
+                                                value: appeared
+                                            )
+                                        }
+                                    } header: {
+                                        MonthSectionHeader(label: monthLabel)
+                                    }
+                                }
+                            }
+                            .padding(.bottom, 32)
+                        }
                     }
                 }
             }
@@ -222,12 +246,40 @@ struct TravelVlogView: View {
             .navigationDestination(for: LocationGroup.self) { city in
                 CityDetailView(city: city).environmentObject(analyzer)
             }
+            .navigationDestination(isPresented: Binding(
+                get: { selectedCity != nil },
+                set: { if !$0 { selectedCity = nil } }
+            )) {
+                if let city = selectedCity {
+                    CityDetailView(city: city).environmentObject(analyzer)
+                }
+            }
             .sheet(isPresented: $isMapExpanded) {
                 FullScreenMapView().environmentObject(analyzer)
             }
             .onAppear {
                 withAnimation { appeared = true }
-                fitMapToAllPins()
+                if selectedYear == nil {
+                    let cal = Calendar.current
+                    let latestDate = analyzer.locationsBreakdown
+                        .compactMap { $0.assets.first?.creationDate }
+                        .sorted(by: >)
+                        .first
+                    
+                    if let latest = latestDate {
+                        selectedYear = cal.component(.year, from: latest)
+                        selectedMonth = cal.component(.month, from: latest)
+                    }
+                }
+            }
+            .task(id: selectedYear) {
+                await performProcessing()
+            }
+            .task(id: selectedMonth) {
+                await performProcessing()
+            }
+            .task(id: analyzer.locationsBreakdown) {
+                await performProcessing()
             }
         }
     }
@@ -235,11 +287,14 @@ struct TravelVlogView: View {
     // MARK: - Map Card
     private var mapCard: some View {
         ZStack(alignment: .bottomTrailing) {
-            Map(coordinateRegion: $mapRegion, annotationItems: locationMarkers) { marker in
+            Map(coordinateRegion: $mapRegion, annotationItems: displayedMarkers) { marker in
                 MapAnnotation(coordinate: marker.coordinate) {
-                    NavigationLink(value: allCities.first(where: { $0.name == marker.name })) {
+                    Button(action: {
+                        selectedCity = analyzer.locationsBreakdown.first(where: { $0.name == marker.name })
+                    }) {
                         CompactMapPin(name: marker.name, count: marker.count)
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .frame(height: 210)
@@ -265,15 +320,55 @@ struct TravelVlogView: View {
         .padding(.top, 8)
     }
 
+    private var showMapPlaceholder: some View {
+        Button {
+            withAnimation(.spring(response: 0.45, dampingFraction: 0.82)) {
+                showMap = true
+            }
+        } label: {
+            HStack(spacing: 12) {
+                Image(systemName: "map.fill")
+                    .font(.title2)
+                    .foregroundColor(.purple)
+                    .frame(width: 48, height: 48)
+                    .background(Color.purple.opacity(0.1))
+                    .cornerRadius(12)
+                
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Show Interactive Map")
+                        .font(.headline)
+                        .foregroundColor(.primary)
+                    Text("Load \(displayedMarkers.count) travel locations on the map")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .foregroundColor(.secondary)
+            }
+            .padding(16)
+            .background(Color(.secondarySystemGroupedBackground))
+            .cornerRadius(20)
+            .overlay(
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(Color.black.opacity(0.05), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.04), radius: 8, y: 4)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Stats row
     private var statsRow: some View {
         HStack(spacing: 10) {
-            MiniStat(icon: "mappin.circle.fill", value: "\(filteredCities.count)", label: "Places")
-            MiniStat(icon: "photo.fill", value: "\(filteredCities.reduce(0){$0+$1.count})", label: "Photos")
-            if let oldest = allCities.last?.assets.first?.creationDate {
+            MiniStat(icon: "mappin.circle.fill", value: "\(displayedCitiesCount)", label: "Places")
+            MiniStat(icon: "photo.fill", value: "\(displayedGroups.reduce(0) { $0 + $1.1.reduce(0) { $0 + $1.count } })", label: "Photos")
+            if let oldest = analyzer.locationsBreakdown.last?.assets.first?.creationDate {
                 MiniStat(icon: "calendar", value: fmtYear(oldest), label: "Since")
             }
-            if let newest = filteredCities.first?.assets.first?.creationDate {
+            if let newest = displayedGroups.first?.1.first?.assets.first?.creationDate {
                 MiniStat(icon: "clock.fill", value: fmtMonth(newest), label: "Latest")
             }
         }
@@ -304,7 +399,6 @@ struct TravelVlogView: View {
                                     selectedYear = selectedYear == year ? nil : year
                                     selectedMonth = nil
                                 }
-                                fitMapToFilter()
                             }
                         )
                     }
@@ -348,25 +442,76 @@ struct TravelVlogView: View {
 
     // MARK: - Helpers
     private func monthName(_ m: Int) -> String {
-        let f = DateFormatter()
-        return f.standaloneMonthSymbols[m - 1]
+        monthFormatter.standaloneMonthSymbols[m - 1]
     }
 
-    private var locationMarkers: [LocationMarker] {
-        (filteredCities.isEmpty ? allCities : filteredCities).compactMap { group in
-            guard let asset = group.assets.first(where: { $0.latitude != nil && $0.longitude != nil }),
-                  let lat = asset.latitude, let lon = asset.longitude else { return nil }
-            return LocationMarker(
-                name: group.name,
-                coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
-                count: group.count,
-                firstAssetIdentifier: asset.localIdentifier
-            )
-        }
+    private func performProcessing() async {
+        isProcessing = true
+        let year = selectedYear
+        let month = selectedMonth
+        let cities = analyzer.locationsBreakdown
+
+        let result = await Task.detached(priority: .userInitiated) { () -> (groups: [(String, [LocationGroup])], count: Int, markers: [LocationMarker]) in
+            let cal = Calendar.current
+
+            // 1. Sort all cities
+            let sortedCities = cities.sorted {
+                ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
+            }
+
+            // 2. Filter cities by selected year/month
+            let filtered = sortedCities.filter { city in
+                guard let d = city.assets.first?.creationDate else { return false }
+                let y = cal.component(.year, from: d)
+                let m = cal.component(.month, from: d)
+                if let sy = year, sy != y { return false }
+                if let sm = month, sm != m { return false }
+                return true
+            }
+
+            // 3. Group by month
+            var groups: [String: [LocationGroup]] = [:]
+            var orderMap: [String: Date] = [:]
+
+            let monthFormatter = DateFormatter()
+            monthFormatter.dateFormat = "MMM yyyy"
+
+            for city in filtered {
+                guard let d = city.assets.first?.creationDate else { continue }
+                let key = monthFormatter.string(from: d)
+                groups[key, default: []].append(city)
+                if orderMap[key] == nil { orderMap[key] = d }
+            }
+
+            let sortedGroups = groups.sorted {
+                (orderMap[$0.key] ?? .distantPast) > (orderMap[$1.key] ?? .distantPast)
+            }
+
+            // 4. Compute location markers for this filtered set
+            let markers = filtered.compactMap { group -> LocationMarker? in
+                guard let asset = group.assets.first(where: { $0.latitude != nil && $0.longitude != nil }),
+                      let lat = asset.latitude, let lon = asset.longitude else { return nil }
+                return LocationMarker(
+                    name: group.name,
+                    coordinate: CLLocationCoordinate2D(latitude: lat, longitude: lon),
+                    count: group.count,
+                    firstAssetIdentifier: asset.localIdentifier
+                )
+            }
+
+            return (sortedGroups, filtered.count, markers)
+        }.value
+
+        self.displayedGroups = result.groups
+        self.displayedCitiesCount = result.count
+        self.displayedMarkers = result.markers
+        self.isProcessing = false
+
+        self.fitMapToAllPins()
     }
 
     private func fitMapToAllPins() {
-        let markers = locationMarkers
+        let markers = displayedMarkers
         guard !markers.isEmpty else { return }
         if markers.count == 1 {
             mapRegion = MKCoordinateRegion(center: markers[0].coordinate,
@@ -384,9 +529,96 @@ struct TravelVlogView: View {
         )
         withAnimation(.easeInOut(duration: 0.8)) { mapRegion = MKCoordinateRegion(center: center, span: span) }
     }
+}
 
-    private func fitMapToFilter() {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { fitMapToAllPins() }
+// MARK: - Skeleton Helpers
+struct SkeletonRect: View {
+    @State private var isAnimating = false
+    let width: CGFloat?
+    let height: CGFloat
+    let cornerRadius: CGFloat
+
+    init(width: CGFloat? = nil, height: CGFloat, cornerRadius: CGFloat = 8) {
+        self.width = width
+        self.height = height
+        self.cornerRadius = cornerRadius
+    }
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: cornerRadius)
+            .fill(Color(UIColor.secondarySystemFill))
+            .frame(width: width, height: height)
+            .opacity(isAnimating ? 0.45 : 0.85)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) {
+                    isAnimating = true
+                }
+            }
+    }
+}
+
+struct TravelVlogSkeletonView: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            // Stats skeleton
+            HStack(spacing: 10) {
+                ForEach(0..<4) { _ in
+                    SkeletonRect(height: 50, cornerRadius: 12)
+                }
+            }
+            .padding(.horizontal, 16)
+
+            // Chips row skeleton
+            HStack(spacing: 8) {
+                SkeletonRect(width: 50, height: 32, cornerRadius: 16)
+                SkeletonRect(width: 70, height: 32, cornerRadius: 16)
+                SkeletonRect(width: 70, height: 32, cornerRadius: 16)
+                SkeletonRect(width: 70, height: 32, cornerRadius: 16)
+            }
+            .padding(.horizontal, 18)
+
+            // Header skeleton
+            HStack(spacing: 8) {
+                SkeletonRect(width: 4, height: 20, cornerRadius: 2)
+                SkeletonRect(width: 140, height: 20, cornerRadius: 4)
+            }
+            .padding(.horizontal, 18)
+            .padding(.top, 10)
+
+            // Cards skeleton
+            VStack(spacing: 16) {
+                ForEach(0..<3) { _ in
+                    HStack(alignment: .top, spacing: 0) {
+                        // Spine circle
+                        VStack(spacing: 0) {
+                            SkeletonRect(width: 10, height: 10, cornerRadius: 5)
+                                .padding(.top, 20)
+                            Rectangle()
+                                .fill(Color(UIColor.tertiarySystemFill))
+                                .frame(width: 2)
+                                .frame(maxHeight: .infinity)
+                        }
+                        .frame(width: 24)
+
+                        // Main card body
+                        VStack(alignment: .leading, spacing: 12) {
+                            SkeletonRect(height: 108, cornerRadius: 14)
+                            VStack(alignment: .leading, spacing: 6) {
+                                SkeletonRect(width: 160, height: 14)
+                                SkeletonRect(width: 100, height: 10)
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.bottom, 12)
+                        }
+                        .background(Color(UIColor.secondarySystemGroupedBackground))
+                        .cornerRadius(14)
+                        .padding(.leading, 12)
+                    }
+                    .frame(height: 170)
+                    .padding(.horizontal, 18)
+                }
+            }
+        }
     }
 }
 

@@ -131,6 +131,8 @@ private let cacheQueue = DispatchQueue(label: "com.photoscanner.cache", qos: .ba
 
 @MainActor
 public final class PhotoAnalyzer: NSObject, ObservableObject {
+    public static var shared: PhotoAnalyzer? = nil
+    
     @Published public var authorizationStatus: PHAuthorizationStatus = .notDetermined
     @Published public var isScanning = false
     @Published public var scanProgress: Double = 0.0
@@ -139,6 +141,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     @Published public var analyzedAssets: [AnalyzedAsset] = []
     @Published public var stats = DashboardStats()
     @Published public var isDemoMode = false
+    @Published public var isFirstScanCompleted = false
     @Published public var monthlyBreakdown: [MonthStats] = []
     @Published public var similarPhotosGroups: [SimilarPhotoGroup] = []
     @Published public var customAlbums: [CustomAlbum] = []
@@ -157,6 +160,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
 
     public override init() {
         super.init()
+        PhotoAnalyzer.shared = self
         self.loadAlbums()
         self.loadLocationCache()
         self.loadCache()
@@ -194,34 +198,76 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         if status == .authorized || status == .limited { await startScan() }
     }
     
-    // MARK: - Cache I/O (background thread)
+    // MARK: - Cache I/O (Asynchronous File-based Document Database)
+    private func getCacheDirectory() -> URL {
+        let paths = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)
+        let directory = paths[0]
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }
+    
+    private func getCacheFileURL() -> URL {
+        getCacheDirectory().appendingPathComponent("analyzed_assets.json")
+    }
+    
+    private func getLocationsCacheFileURL() -> URL {
+        getCacheDirectory().appendingPathComponent("geocoded_locations.json")
+    }
+    
+    private func getAlbumsFileURL() -> URL {
+        getCacheDirectory().appendingPathComponent("custom_albums.json")
+    }
+
     private func loadCache() {
-        guard let data = UserDefaults.standard.data(forKey: "cached_analyzed_assets"),
-              let decoded = try? JSONDecoder().decode([AnalyzedAsset].self, from: data) else { return }
-        self.analyzedAssets = decoded
-        self.totalScanned = decoded.count
-        self.totalAssetsCount = decoded.count
-        self.calculateStatsBackground()  // non-blocking
+        let fileURL = getCacheFileURL()
+        cacheQueue.async { [weak self] in
+            guard let self else { return }
+            guard let data = try? Data(contentsOf: fileURL),
+                  let decoded = try? JSONDecoder().decode([AnalyzedAsset].self, from: data) else { return }
+            
+            DispatchQueue.main.async {
+                self.analyzedAssets = decoded
+                self.totalScanned = decoded.count
+                self.totalAssetsCount = decoded.count
+                self.isFirstScanCompleted = true
+                self.calculateStatsBackground()
+            }
+        }
     }
     
     private func saveCache() {
         let snapshot = self.analyzedAssets
+        let fileURL = getCacheFileURL()
         cacheQueue.async {
             if let encoded = try? JSONEncoder().encode(snapshot) {
-                UserDefaults.standard.set(encoded, forKey: "cached_analyzed_assets")
+                try? encoded.write(to: fileURL, options: .atomic)
             }
         }
     }
     
     private func loadLocationCache() {
-        if let cached = UserDefaults.standard.dictionary(forKey: "geocoded_locations_cache") as? [String: String] {
-            self.locationCache = cached
+        let fileURL = getLocationsCacheFileURL()
+        cacheQueue.async { [weak self] in
+            guard let self else { return }
+            guard let data = try? Data(contentsOf: fileURL),
+                  let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return }
+            
+            let cleaned = decoded.filter { !$0.value.hasPrefix("Location (") && !$0.value.contains(",") }
+            
+            DispatchQueue.main.async {
+                self.locationCache = cleaned
+            }
         }
     }
     
     private func saveLocationCache() {
         let snapshot = self.locationCache
-        cacheQueue.async { UserDefaults.standard.set(snapshot, forKey: "geocoded_locations_cache") }
+        let fileURL = getLocationsCacheFileURL()
+        cacheQueue.async {
+            if let encoded = try? JSONEncoder().encode(snapshot) {
+                try? encoded.write(to: fileURL, options: .atomic)
+            }
+        }
     }
     
     // MARK: - Core Scan  ────────────────────────────────────────────────────
@@ -238,10 +284,9 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             fetchOptions.includeHiddenAssets = false
             let fetchResult = PHAsset.fetchAssets(with: fetchOptions)
             let count = fetchResult.count
-            self.totalAssetsCount = count
             
             #if targetEnvironment(simulator)
-            if count == 0 || self.authorizationStatus == .denied || self.authorizationStatus == .restricted {
+            if count < 15 || self.authorizationStatus == .denied || self.authorizationStatus == .restricted {
                 try? await Task.sleep(nanoseconds: 800_000_000)
                 self.generateMockAssets()
                 self.isScanning = false
@@ -250,8 +295,10 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             #endif
             
             if count == 0 {
+                self.totalAssetsCount = 0
                 self.analyzedAssets = []
                 self.isScanning = false
+                self.isFirstScanCompleted = true
                 self.calculateStatsBackground()
                 self.saveCache()
                 return
@@ -268,15 +315,17 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             
             // ── 3. Incremental diff: only process truly new assets ────────
             let currentIds: Set<String> = Set(assetsArray.map(\.localIdentifier))
+            self.totalAssetsCount = currentIds.count
             var updatedAssets = self.analyzedAssets.filter { currentIds.contains($0.localIdentifier) }
             let scannedIds: Set<String> = Set(updatedAssets.map(\.localIdentifier))
             let newAssets = assetsArray.filter { !scannedIds.contains($0.localIdentifier) }
             
-            if newAssets.isEmpty && updatedAssets.count == count {
+            if newAssets.isEmpty && updatedAssets.count == currentIds.count {
                 // Perfect cache hit — instant return, no blocking stats
                 self.analyzedAssets = updatedAssets
                 self.totalScanned = updatedAssets.count
                 self.scanProgress = 1.0
+                self.isFirstScanCompleted = true
                 self.isScanning = false
                 self.calculateStatsBackground()
                 return
@@ -329,18 +378,18 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
                 }
             }
             
-            if !Task.isCancelled {
-                updatedAssets.append(contentsOf: tempNewAssets)
-                self.analyzedAssets = updatedAssets
-                self.totalScanned = updatedAssets.count
-            }
-            
-            // Mark scan done FIRST, then run heavy stats in background
-            self.scanProgress = 1.0
-            self.isScanning = false
+            updatedAssets.append(contentsOf: tempNewAssets)
+            self.analyzedAssets = updatedAssets
+            self.totalScanned = updatedAssets.count
             self.saveCache()
             self.calculateStatsBackground()
-            self.kickoffGeocoding()
+            
+            if !Task.isCancelled {
+                self.scanProgress = 1.0
+                self.isFirstScanCompleted = true
+                self.kickoffGeocoding()
+            }
+            self.isScanning = false
         }
     }
     
@@ -348,8 +397,8 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     private nonisolated func analyzeAsset(_ asset: PHAsset, locationCacheSnapshot: [String: String]) -> AnalyzedAsset {
         let resources = PHAssetResource.assetResources(for: asset)
         let primary = resources.first
-        let fileSize = primary?.value(forKey: "fileSize") as? Int64 ?? 0
-        let isLocal  = primary?.value(forKey: "locallyAvailable") as? Bool ?? true
+        let fileSize = (primary?.value(forKey: "fileSize") as? NSNumber)?.int64Value ?? 0
+        let isLocal  = (primary?.value(forKey: "locallyAvailable") as? NSNumber)?.boolValue ?? true
         let fileName = primary?.originalFilename ?? "Unknown"
         
         var locName: String? = nil
@@ -360,7 +409,9 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             lon = loc.coordinate.longitude
             let key = geoKey(loc.coordinate.latitude, loc.coordinate.longitude)
             locName = locationCacheSnapshot[key]
-            // Don't fallback to "Location(lat,lon)" — leave nil, geocoder will fill it
+            if locName?.hasPrefix("Location (") == true || locName?.contains(",") == true {
+                locName = nil
+            }
         }
         
         return AnalyzedAsset(
@@ -385,25 +436,47 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     
     private func calculateStatsBackground() {
         let snapshot = self.analyzedAssets
+        let cacheCopy = self.locationCache
+        let inFlightCopy = self.inFlightGeocodes
+        
         Task.detached(priority: .userInitiated) { [weak self] in
             guard let self else { return }
-            let result = await self.computeStats(snapshot)
+            let result = await self.computeStats(snapshot, locationCache: cacheCopy, inFlightGeocodes: inFlightCopy)
             await MainActor.run {
                 self.stats = result.stats
                 self.similarPhotosGroups = result.similar
                 self.monthlyBreakdown = result.monthly
-                // Locations breakdown is recalculated on main actor (needs locationCache)
-                self.calculateLocationsBreakdownFast()
+                self.locationsBreakdown = result.locations
+                self.geoKeyToIndices = result.geoKeyToIndices
+                
+                if !result.keysNeedingGeocode.isEmpty {
+                    self.geocodePendingKeys.append(contentsOf: result.keysNeedingGeocode)
+                    self.startGeocodingQueue()
+                }
             }
         }
     }
     
     // Pure computation — runs off main thread
-    private nonisolated func computeStats(_ assets: [AnalyzedAsset]) async
-        -> (stats: DashboardStats, similar: [SimilarPhotoGroup], monthly: [MonthStats]) {
+    private nonisolated func computeStats(
+        _ assets: [AnalyzedAsset],
+        locationCache: [String: String],
+        inFlightGeocodes: Set<String>
+    ) async -> (
+        stats: DashboardStats,
+        similar: [SimilarPhotoGroup],
+        monthly: [MonthStats],
+        locations: [LocationGroup],
+        geoKeyToIndices: [String: [Int]],
+        keysNeedingGeocode: [String]
+    ) {
         var s = DashboardStats()
         s.totalCount = assets.count
-        for a in assets {
+        
+        var groups: [String: [AnalyzedAsset]] = [:]
+        var geoKeyToIndices: [String: [Int]] = [:]
+        
+        for (i, a) in assets.enumerated() {
             s.totalSize += a.fileSize
             switch a.mediaType {
             case .image:
@@ -424,10 +497,51 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
             if a.syncStatus == .syncedLocal || a.syncStatus == .offloaded {
                 s.iCloudPhotosCount += 1; s.iCloudPhotosSize += a.fileSize
             }
+            
+            // Build groups for locations
+            if let lat = a.latitude, let lon = a.longitude {
+                let key = String(format: "%.2f,%.2f", lat, lon)
+                groups[key, default: []].append(a)
+                geoKeyToIndices[key, default: []].append(i)
+            }
         }
+        
         let similar = computeSimilar(assets)
         let monthly = computeMonthly(assets)
-        return (s, similar, monthly)
+        
+        // Build LocationGroups
+        var tempGroups: [LocationGroup] = []
+        var keysNeedingGeocode: [String] = []
+        
+        for (key, groupAssets) in groups {
+            let name = locationCache[key]
+            let displayName: String
+            let needsGeocode: Bool
+            
+            if let name = name, !name.hasPrefix("Location ("), !name.contains(",") {
+                displayName = name
+                needsGeocode = false
+            } else {
+                displayName = "Exploring…"
+                needsGeocode = true
+            }
+            
+            tempGroups.append(LocationGroup(
+                name: displayName,
+                count: groupAssets.count,
+                size: groupAssets.reduce(0) { $0 + $1.fileSize },
+                assets: groupAssets
+            ))
+            if needsGeocode && !inFlightGeocodes.contains(key) {
+                keysNeedingGeocode.append(key)
+            }
+        }
+        
+        let locations = tempGroups.sorted {
+            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
+        }
+        
+        return (s, similar, monthly, locations, geoKeyToIndices, keysNeedingGeocode)
     }
     
     private nonisolated func computeSimilar(_ assets: [AnalyzedAsset]) -> [SimilarPhotoGroup] {
@@ -470,54 +584,6 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     
     // Kept for compatibility — delegates to background variant
     private func calculateStatsImmediate() { calculateStatsBackground() }
-    
-    // MARK: - Locations breakdown  O(n) dict grouping ─────────────────────
-    private func calculateLocationsBreakdownFast() {
-        var groups:   [String: [AnalyzedAsset]] = [:]
-        var keyToCoord: [String: (Double, Double)] = [:]
-        
-        for a in analyzedAssets {
-            guard let lat = a.latitude, let lon = a.longitude else { continue }
-            let key = geoKey(lat, lon)
-            groups[key, default: []].append(a)
-            if keyToCoord[key] == nil { keyToCoord[key] = (lat, lon) }
-        }
-        
-        // Rebuild geoKey index for O(1) geocode updates
-        geoKeyToIndices = [:]
-        for (i, a) in analyzedAssets.enumerated() {
-            guard let lat = a.latitude, let lon = a.longitude else { continue }
-            let key = geoKey(lat, lon)
-            geoKeyToIndices[key, default: []].append(i)
-        }
-        
-        var tempGroups: [LocationGroup] = []
-        var keysNeedingGeocode: [String] = []
-        
-        for (key, assets) in groups {
-            let name = locationCache[key]  // nil if not geocoded yet
-            let displayName = name ?? "Exploring…"
-            tempGroups.append(LocationGroup(
-                name: displayName,
-                count: assets.count,
-                size: assets.reduce(0) { $0 + $1.fileSize },
-                assets: assets
-            ))
-            if name == nil && !inFlightGeocodes.contains(key) {
-                keysNeedingGeocode.append(key)
-            }
-        }
-        
-        self.locationsBreakdown = tempGroups.sorted {
-            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
-        }
-        
-        // Enqueue new geocode keys (rate-limited)
-        if !keysNeedingGeocode.isEmpty {
-            geocodePendingKeys.append(contentsOf: keysNeedingGeocode)
-            startGeocodingQueue()
-        }
-    }
     
     // MARK: - Rate-limited geocoding queue (Apple allows ~50 geocodes/min) ─
     private func kickoffGeocoding() {
@@ -587,27 +653,37 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         }
     }
     
-    // Lightweight re-build of just locationsBreakdown (skips similar/monthly recalc)
     private func refreshLocationsBreakdownOnly() {
-        var groups: [String: [AnalyzedAsset]] = [:]
-        for a in analyzedAssets {
-            guard let lat = a.latitude, let lon = a.longitude else { continue }
-            groups[geoKey(lat, lon), default: []].append(a)
+        let snapshot = self.analyzedAssets
+        let cacheCopy = self.locationCache
+        
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            var groups: [String: [AnalyzedAsset]] = [:]
+            for a in snapshot {
+                guard let lat = a.latitude, let lon = a.longitude else { continue }
+                let key = String(format: "%.2f,%.2f", lat, lon)
+                groups[key, default: []].append(a)
+            }
+            var tempGroups: [LocationGroup] = []
+            for (key, assets) in groups {
+                let name = cacheCopy[key] ?? "Exploring…"
+                tempGroups.append(LocationGroup(
+                    name: name,
+                    count: assets.count,
+                    size: assets.reduce(0) { $0 + $1.fileSize },
+                    assets: assets
+                ))
+            }
+            let sorted = tempGroups.sorted {
+                ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
+            }
+            
+            await MainActor.run {
+                self.locationsBreakdown = sorted
+                self.saveCache()
+            }
         }
-        var tempGroups: [LocationGroup] = []
-        for (key, assets) in groups {
-            let name = locationCache[key] ?? "Exploring…"
-            tempGroups.append(LocationGroup(
-                name: name,
-                count: assets.count,
-                size: assets.reduce(0) { $0 + $1.fileSize },
-                assets: assets
-            ))
-        }
-        self.locationsBreakdown = tempGroups.sorted {
-            ($0.assets.first?.creationDate ?? .distantPast) > ($1.assets.first?.creationDate ?? .distantPast)
-        }
-        self.saveCache()
     }
     
     // MARK: - Demo mode
@@ -654,6 +730,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         self.analyzedAssets = tempAssets.sorted { $0.fileSize > $1.fileSize }
         self.totalScanned = tempAssets.count
         self.totalAssetsCount = tempAssets.count
+        self.isFirstScanCompleted = true
         self.calculateStatsImmediate()
         self.authorizationStatus = .authorized
     }
@@ -694,13 +771,19 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     
     // MARK: - Custom Albums
     public func saveAlbums() {
-        if let encoded = try? JSONEncoder().encode(customAlbums) {
-            UserDefaults.standard.set(encoded, forKey: "custom_albums")
+        let snapshot = self.customAlbums
+        let fileURL = getAlbumsFileURL()
+        cacheQueue.async {
+            if let encoded = try? JSONEncoder().encode(snapshot) {
+                try? encoded.write(to: fileURL, options: .atomic)
+            }
         }
     }
     
     public func loadAlbums() {
-        if let data = UserDefaults.standard.data(forKey: "custom_albums"),
+        let fileURL = getAlbumsFileURL()
+        // Synchronous initial check or read is okay for launch default setup
+        if let data = try? Data(contentsOf: fileURL),
            let decoded = try? JSONDecoder().decode([CustomAlbum].self, from: data) {
             self.customAlbums = decoded
         } else {

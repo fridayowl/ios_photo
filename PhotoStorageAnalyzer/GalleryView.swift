@@ -20,6 +20,16 @@ struct ShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+private let monthYearStringFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f
+}()
+private let fullDayStringFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateStyle = .long; return f
+}()
+private let dayNumberFormatter: DateFormatter = {
+    let f = DateFormatter(); f.dateFormat = "d"; return f
+}()
+
 struct GalleryView: View {
     @EnvironmentObject var analyzer: PhotoAnalyzer
     
@@ -486,11 +496,24 @@ extension GalleryView {
                     // Show photos for selected day
                     let dayAssets = assetsForDate(selectedDate)
                     VStack(alignment: .leading, spacing: 8) {
-                        HStack {
+                        HStack(spacing: 8) {
                             Text(fullDayString(selectedDate))
                                 .font(.system(.subheadline, design: .rounded, weight: .bold))
                                 .foregroundColor(.primary)
+                            
+                            Button(action: {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                    selectedCalendarDate = nil
+                                }
+                            }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundColor(.secondary.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                            
                             Spacer()
+                            
                             Text("\(dayAssets.count) photos")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
@@ -551,15 +574,15 @@ extension GalleryView {
     }
     
     private func monthYearString(_ date: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f.string(from: date)
+        monthYearStringFormatter.string(from: date)
     }
     
     private func fullDayString(_ date: Date) -> String {
-        let f = DateFormatter(); f.dateStyle = .long; return f.string(from: date)
+        fullDayStringFormatter.string(from: date)
     }
     
     private func dayNumber(_ date: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "d"; return f.string(from: date)
+        dayNumberFormatter.string(from: date)
     }
     
     private func calendarDays(for month: Date) -> [Date?] {
@@ -614,7 +637,7 @@ extension GalleryView {
 
 // MARK: - LOCATIONS VIEW
 struct LocationMarker: Identifiable {
-    let id = UUID()
+    var id: String { name }
     let name: String
     let coordinate: CLLocationCoordinate2D
     let count: Int
@@ -1334,6 +1357,7 @@ struct FullScreenMapView: View {
     )
     
     @State private var sharingImage: UIImage? = nil
+    @State private var selectedCity: LocationGroup? = nil
     
     var body: some View {
         NavigationStack {
@@ -1341,13 +1365,12 @@ struct FullScreenMapView: View {
                 // Expanded Map
                 Map(coordinateRegion: $region, annotationItems: locationMarkers) { marker in
                     MapAnnotation(coordinate: marker.coordinate) {
-                        NavigationLink {
-                            if let cityGroup = analyzer.locationsBreakdown.first(where: { $0.name == marker.name }) {
-                                cityGalleryView(cityName: cityGroup.name, assets: cityGroup.assets)
-                            }
-                        } label: {
+                        Button(action: {
+                            selectedCity = analyzer.locationsBreakdown.first(where: { $0.name == marker.name })
+                        }) {
                             CityMapPin(assetIdentifier: marker.firstAssetIdentifier, count: marker.count)
                         }
+                        .buttonStyle(.plain)
                     }
                 }
                 .ignoresSafeArea(edges: .bottom)
@@ -1385,6 +1408,14 @@ struct FullScreenMapView: View {
                 set: { sharingImage = $0?.items.first as? UIImage }
             )) { container in
                 ShareSheet(activityItems: container.items)
+            }
+            .navigationDestination(isPresented: Binding(
+                get: { selectedCity != nil },
+                set: { if !$0 { selectedCity = nil } }
+            )) {
+                if let cityGroup = selectedCity {
+                    cityGalleryView(cityName: cityGroup.name, assets: cityGroup.assets)
+                }
             }
         }
     }

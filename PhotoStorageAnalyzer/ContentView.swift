@@ -15,7 +15,7 @@ struct ContentView: View {
             case .denied, .restricted:
                 permissionDeniedView
             case .authorized, .limited:
-                if analyzer.analyzedAssets.isEmpty {
+                if !analyzer.isFirstScanCompleted {
                     // Show scanning/loading screen until we have data (first launch or cache miss)
                     scanningView
                         .onAppear {
@@ -29,7 +29,7 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.3), value: analyzer.authorizationStatus.rawValue)
-        .animation(.easeInOut(duration: 0.3), value: analyzer.analyzedAssets.isEmpty)
+        .animation(.easeInOut(duration: 0.3), value: analyzer.isFirstScanCompleted)
         .task {
             if analyzer.authorizationStatus == .authorized || analyzer.authorizationStatus == .limited {
                 await analyzer.startScan()
