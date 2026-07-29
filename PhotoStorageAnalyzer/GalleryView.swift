@@ -39,6 +39,8 @@ struct GalleryView: View {
         center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0),
         span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
     )
+    @State private var selectedCalendarDate: Date? = nil
+    @State private var calendarDisplayMonth: Date = Date()
     
     @Namespace private var tabAnimation
     
@@ -376,21 +378,222 @@ extension GalleryView {
     
     private var calendarTimeline: some View {
         ScrollView {
-            LazyVStack(spacing: 6) {
-                let grouped = groupAssetsByMonth(analyzer.analyzedAssets)
-                ForEach(grouped, id: \.0) { monthName, items in
-                    CollapsibleMonthSection(
-                        monthName: monthName,
-                        assets: items,
-                        columns: columns,
-                        columnsCount: columnsCount,
-                        fitToAspectRatio: fitToAspectRatio,
-                        selectedAsset: $selectedAsset,
-                        contextMenuProvider: { AnyView(gridCellContextMenu(for: $0)) }
-                    )
+            VStack(spacing: 0) {
+                // MARK: Calendar Picker
+                VStack(spacing: 0) {
+                    // Month navigation header
+                    HStack {
+                        Button(action: { shiftMonth(-1) }) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.purple)
+                                .padding(8)
+                                .background(Color.purple.opacity(0.08))
+                                .clipShape(Circle())
+                        }
+                        
+                        Spacer()
+                        
+                        Text(monthYearString(calendarDisplayMonth))
+                            .font(.system(.headline, design: .rounded, weight: .bold))
+                            .foregroundColor(.primary)
+                        
+                        Spacer()
+                        
+                        Button(action: { shiftMonth(1) }) {
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundColor(.purple)
+                                .padding(8)
+                                .background(Color.purple.opacity(0.08))
+                                .clipShape(Circle())
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    
+                    // Weekday labels
+                    HStack(spacing: 0) {
+                        ForEach(["S","M","T","W","T","F","S"], id: \.self) { d in
+                            Text(d)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 6)
+                    
+                    // Day grid
+                    let days = calendarDays(for: calendarDisplayMonth)
+                    let photoDates = photoDatesInMonth(calendarDisplayMonth)
+                    
+                    LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 0), count: 7), spacing: 4) {
+                        ForEach(days, id: \.self) { day in
+                            if let day = day {
+                                let hasPhotos = photoDates.contains(day)
+                                let isSelected = selectedCalendarDate.map { Calendar.current.isDate($0, inSameDayAs: day) } ?? false
+                                let isToday = Calendar.current.isDateInToday(day)
+                                
+                                Button(action: {
+                                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                                        selectedCalendarDate = isSelected ? nil : day
+                                    }
+                                }) {
+                                    VStack(spacing: 2) {
+                                        Text(dayNumber(day))
+                                            .font(.system(size: 14, weight: isToday || isSelected ? .bold : .regular))
+                                            .foregroundColor(
+                                                isSelected ? .white :
+                                                isToday ? .purple :
+                                                hasPhotos ? .primary : .secondary.opacity(0.45)
+                                            )
+                                            .frame(width: 32, height: 32)
+                                            .background(
+                                                Group {
+                                                    if isSelected {
+                                                        Circle().fill(Color.purple)
+                                                    } else if isToday {
+                                                        Circle().fill(Color.purple.opacity(0.12))
+                                                    } else {
+                                                        Circle().fill(Color.clear)
+                                                    }
+                                                }
+                                            )
+                                        
+                                        // Dot if photos exist on this day
+                                        Circle()
+                                            .fill(hasPhotos ? (isSelected ? Color.white.opacity(0.7) : Color.purple) : Color.clear)
+                                            .frame(width: 4, height: 4)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                Color.clear.frame(height: 44)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 12)
+                }
+                .background(Color(UIColor.secondarySystemGroupedBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                
+                // MARK: Photos for selected day OR month list
+                if let selectedDate = selectedCalendarDate {
+                    // Show photos for selected day
+                    let dayAssets = assetsForDate(selectedDate)
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text(fullDayString(selectedDate))
+                                .font(.system(.subheadline, design: .rounded, weight: .bold))
+                                .foregroundColor(.primary)
+                            Spacer()
+                            Text("\(dayAssets.count) photos")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.top, 16)
+                        
+                        if dayAssets.isEmpty {
+                            VStack(spacing: 10) {
+                                Image(systemName: "photo.slash")
+                                    .font(.system(size: 36))
+                                    .foregroundColor(.secondary.opacity(0.4))
+                                Text("No photos on this day")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 40)
+                        } else {
+                            LazyVGrid(columns: columns, spacing: 4) {
+                                ForEach(dayAssets) { asset in
+                                    ThumbnailCell(asset: asset, columnsCount: columnsCount, fitToAspectRatio: fitToAspectRatio)
+                                        .onTapGesture { selectedAsset = asset }
+                                        .contextMenu { gridCellContextMenu(for: asset) }
+                                }
+                            }
+                            .padding(.horizontal, 4)
+                        }
+                    }
+                } else {
+                    // Show all months
+                    LazyVStack(spacing: 6) {
+                        let grouped = groupAssetsByMonth(analyzer.analyzedAssets)
+                        ForEach(grouped, id: \.0) { monthName, items in
+                            CollapsibleMonthSection(
+                                monthName: monthName,
+                                assets: items,
+                                columns: columns,
+                                columnsCount: columnsCount,
+                                fitToAspectRatio: fitToAspectRatio,
+                                selectedAsset: $selectedAsset,
+                                contextMenuProvider: { AnyView(gridCellContextMenu(for: $0)) }
+                            )
+                        }
+                    }
+                    .padding(.top, 8)
                 }
             }
-            .padding(.top, 8)
+        }
+    }
+    
+    // MARK: Calendar helpers
+    private func shiftMonth(_ delta: Int) {
+        withAnimation(.easeInOut(duration: 0.25)) {
+            calendarDisplayMonth = Calendar.current.date(byAdding: .month, value: delta, to: calendarDisplayMonth) ?? calendarDisplayMonth
+            selectedCalendarDate = nil
+        }
+    }
+    
+    private func monthYearString(_ date: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "MMMM yyyy"; return f.string(from: date)
+    }
+    
+    private func fullDayString(_ date: Date) -> String {
+        let f = DateFormatter(); f.dateStyle = .long; return f.string(from: date)
+    }
+    
+    private func dayNumber(_ date: Date) -> String {
+        let f = DateFormatter(); f.dateFormat = "d"; return f.string(from: date)
+    }
+    
+    private func calendarDays(for month: Date) -> [Date?] {
+        let cal = Calendar.current
+        guard let range = cal.range(of: .day, in: .month, for: month),
+              let firstDay = cal.date(from: cal.dateComponents([.year, .month], from: month)) else { return [] }
+        let weekdayOffset = (cal.component(.weekday, from: firstDay) - cal.firstWeekday + 7) % 7
+        var days: [Date?] = Array(repeating: nil, count: weekdayOffset)
+        for day in range {
+            days.append(cal.date(byAdding: .day, value: day - 1, to: firstDay))
+        }
+        // Pad to complete final row
+        while days.count % 7 != 0 { days.append(nil) }
+        return days
+    }
+    
+    private func photoDatesInMonth(_ month: Date) -> Set<Date> {
+        let cal = Calendar.current
+        var result: Set<Date> = []
+        for asset in analyzer.analyzedAssets {
+            guard let d = asset.creationDate,
+                  cal.isDate(d, equalTo: month, toGranularity: .month) else { continue }
+            if let normalized = cal.date(from: cal.dateComponents([.year, .month, .day], from: d)) {
+                result.insert(normalized)
+            }
+        }
+        return result
+    }
+    
+    private func assetsForDate(_ date: Date) -> [AnalyzedAsset] {
+        let cal = Calendar.current
+        return analyzer.analyzedAssets.filter { asset in
+            guard let d = asset.creationDate else { return false }
+            return cal.isDate(d, inSameDayAs: date)
         }
     }
     
@@ -403,9 +606,7 @@ extension GalleryView {
             guard let date = asset.creationDate else { continue }
             let key = formatter.string(from: date)
             groups[key, default: []].append(asset)
-            if order[key] == nil {
-                order[key] = date
-            }
+            if order[key] == nil { order[key] = date }
         }
         return groups.sorted(by: { (order[$0.key] ?? Date()) > (order[$1.key] ?? Date()) })
     }
