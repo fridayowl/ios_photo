@@ -34,6 +34,7 @@ struct GalleryView: View {
     // Sharing states
     @State private var sharingItems: [Any]? = nil
     @State private var isPreparingShare = false
+    @State private var isMapExpanded = false
     
     @Namespace private var tabAnimation
     
@@ -513,26 +514,40 @@ extension GalleryView {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 // Interactive Custom Pin Map View
-                Map(coordinateRegion: .constant(MKCoordinateRegion(
-                    center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0), // Center globally
-                    span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
-                )), annotationItems: locationMarkers) { marker in
-                    MapAnnotation(coordinate: marker.coordinate) {
-                        NavigationLink {
-                            if let cityGroup = analyzer.locationsBreakdown.first(where: { $0.name == marker.name }) {
-                                cityGalleryView(cityName: cityGroup.name, assets: cityGroup.assets)
+                ZStack(alignment: .topTrailing) {
+                    Map(coordinateRegion: .constant(MKCoordinateRegion(
+                        center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0), // Center globally
+                        span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
+                    )), annotationItems: locationMarkers) { marker in
+                        MapAnnotation(coordinate: marker.coordinate) {
+                            NavigationLink {
+                                if let cityGroup = analyzer.locationsBreakdown.first(where: { $0.name == marker.name }) {
+                                    cityGalleryView(cityName: cityGroup.name, assets: cityGroup.assets)
+                                }
+                            } label: {
+                                CityMapPin(assetIdentifier: marker.firstAssetIdentifier, count: marker.count)
                             }
-                        } label: {
-                            CityMapPin(assetIdentifier: marker.firstAssetIdentifier, count: marker.count)
                         }
                     }
+                    .frame(height: 200)
+                    .cornerRadius(16)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Color.borderLight, lineWidth: 1)
+                    )
+                    
+                    // Expand Map Button
+                    Button(action: {
+                        isMapExpanded = true
+                    }) {
+                        Image(systemName: "arrow.up.left.and.arrow.down.right.circle.fill")
+                            .font(.title)
+                            .foregroundColor(.purple)
+                            .background(Circle().fill(Color.white))
+                            .shadow(color: .black.opacity(0.15), radius: 4)
+                    }
+                    .padding(12)
                 }
-                .frame(height: 200)
-                .cornerRadius(16)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color.borderLight, lineWidth: 1)
-                )
                 .padding(.horizontal)
                 .padding(.top, 10)
                 
@@ -594,56 +609,97 @@ extension GalleryView {
                     .padding(.horizontal)
                 }
                 
-                // 2. Travel Timeline Track
+                // 2. Travel Vlog Timeline (Vertical footprints diary style)
                 if !analyzer.locationsBreakdown.isEmpty {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("Travel Timeline")
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("🗺️ Travel Vlog Timeline")
                             .font(.headline)
                             .foregroundColor(.primary)
                             .padding(.horizontal)
                         
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 0) {
-                                let timelineCities = analyzer.locationsBreakdown.sorted {
-                                    ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date())
-                                }
-                                
-                                ForEach(Array(timelineCities.enumerated()), id: \.element.name) { index, city in
-                                    HStack(spacing: 0) {
-                                        VStack(spacing: 8) {
+                        VStack(spacing: 0) {
+                            let timelineCities = analyzer.locationsBreakdown.sorted {
+                                ($0.assets.first?.creationDate ?? Date()) > ($1.assets.first?.creationDate ?? Date())
+                            }
+                            
+                            ForEach(Array(timelineCities.enumerated()), id: \.element.name) { index, city in
+                                VStack(spacing: 0) {
+                                    HStack(alignment: .center, spacing: 12) {
+                                        // Vlog Photo Node
+                                        ZStack {
                                             Circle()
-                                                .fill(Color.purple)
-                                                .frame(width: 12, height: 12)
-                                                .overlay(
-                                                    Circle()
-                                                        .stroke(Color.purple.opacity(0.15), lineWidth: 6)
-                                                )
+                                                .fill(LinearGradient(colors: [.purple, .blue], startPoint: .topLeading, endPoint: .bottomTrailing))
+                                                .frame(width: 52, height: 52)
                                             
-                                            Text(city.name.components(separatedBy: ",").first ?? city.name)
-                                                .font(.caption)
-                                                .fontWeight(.bold)
-                                                .foregroundColor(.primary)
-                                            
-                                            if let date = city.assets.first?.creationDate {
-                                                Text(formatMonthYear(date))
-                                                    .font(.system(size: 8))
-                                                    .foregroundColor(.secondary)
+                                            if let firstAsset = city.assets.first {
+                                                TimelineThumbnailView(assetIdentifier: firstAsset.localIdentifier)
+                                                    .frame(width: 46, height: 46)
+                                                    .clipShape(Circle())
+                                            } else {
+                                                Image(systemName: "airplane")
+                                                    .foregroundColor(.white)
                                             }
                                         }
-                                        .frame(width: 100)
                                         
-                                        if index < timelineCities.count - 1 {
-                                            Rectangle()
-                                                .fill(LinearGradient(colors: [.purple, .purple.opacity(0.25)], startPoint: .leading, endPoint: .trailing))
-                                                .frame(width: 50, height: 2)
-                                                .offset(y: -14)
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack(spacing: 4) {
+                                                Text(getTravelEmoji(for: index))
+                                                Text(city.name)
+                                                    .font(.system(.subheadline, design: .rounded))
+                                                    .fontWeight(.bold)
+                                                    .foregroundColor(.primary)
+                                            }
+                                            
+                                            HStack(spacing: 8) {
+                                                if let date = city.assets.first?.creationDate {
+                                                    Label(formatMonthYear(date), systemImage: "calendar")
+                                                        .font(.system(size: 9))
+                                                        .foregroundColor(.secondary)
+                                                }
+                                                
+                                                Label("\(city.count) memories", systemImage: "photo")
+                                                    .font(.system(size: 9))
+                                                    .foregroundColor(.purple)
+                                            }
                                         }
+                                        
+                                        Spacer()
+                                        
+                                        NavigationLink {
+                                            cityGalleryView(cityName: city.name, assets: city.assets)
+                                        } label: {
+                                            Image(systemName: "chevron.right.circle.fill")
+                                                .font(.title2)
+                                                .foregroundColor(.purple)
+                                                .opacity(0.8)
+                                        }
+                                    }
+                                    .padding()
+                                    .background(Color.cardBg)
+                                    .cornerRadius(16)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 16)
+                                            .stroke(Color.borderLight, lineWidth: 1)
+                                    )
+                                    .shadow(color: Color.black.opacity(0.01), radius: 6, y: 3)
+                                    
+                                    // Dash footprint connector line below card
+                                    if index < timelineCities.count - 1 {
+                                        VStack(spacing: 4) {
+                                            ForEach(0..<3) { _ in
+                                                Circle()
+                                                    .fill(Color.purple.opacity(0.35))
+                                                    .frame(width: 4, height: 4)
+                                            }
+                                        }
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(.leading, 42)
+                                        .padding(.vertical, 4)
                                     }
                                 }
                             }
-                            .padding(.horizontal, 20)
-                            .padding(.vertical, 10)
                         }
+                        .padding(.horizontal)
                     }
                 }
                 
@@ -691,6 +747,14 @@ extension GalleryView {
                 .padding(.bottom, 20)
             }
         }
+        .sheet(isPresented: $isMapExpanded) {
+            FullScreenMapView().environmentObject(analyzer)
+        }
+    }
+    
+    private func getTravelEmoji(for index: Int) -> String {
+        let emojis = ["✈️", "🌴", "🗺️", "🏝️", "🏖️", "🏔️", "🗼", "🚗", "⛵"]
+        return emojis[index % emojis.count]
     }
     
     private func cityGalleryView(cityName: String, assets: [AnalyzedAsset]) -> some View {
@@ -1093,5 +1157,210 @@ struct ThumbnailCell: View {
                 self.image = result
             }
         }
+    }
+}
+
+// MARK: - TIMELINE THUMBNAIL (For Vlog Timeline Cards)
+struct TimelineThumbnailView: View {
+    @EnvironmentObject var analyzer: PhotoAnalyzer
+    let assetIdentifier: String
+    
+    @State private var image: UIImage? = nil
+    
+    var body: some View {
+        Group {
+            if let image = image {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.purple.opacity(0.12)
+                    .overlay(
+                        Image(systemName: "photo")
+                            .font(.caption2)
+                            .foregroundColor(.purple)
+                    )
+            }
+        }
+        .onAppear {
+            loadThumbnail()
+        }
+    }
+    
+    private func loadThumbnail() {
+        guard let phAsset = analyzer.getPHAsset(for: assetIdentifier) else {
+            return
+        }
+        let manager = PHImageManager.default()
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .fastFormat
+        options.isSynchronous = false
+        
+        manager.requestImage(
+            for: phAsset,
+            targetSize: CGSize(width: 100, height: 100),
+            contentMode: .aspectFill,
+            options: options
+        ) { result, _ in
+            if let result = result {
+                self.image = result
+            }
+        }
+    }
+}
+
+// MARK: - FULL SCREEN TRAVEL EXPLORER MAP
+struct FullScreenMapView: View {
+    @EnvironmentObject var analyzer: PhotoAnalyzer
+    @Environment(\.dismiss) var dismiss
+    
+    @State private var region = MKCoordinateRegion(
+        center: CLLocationCoordinate2D(latitude: 30.0, longitude: 0.0),
+        span: MKCoordinateSpan(latitudeDelta: 160.0, longitudeDelta: 160.0)
+    )
+    
+    @State private var sharingImage: UIImage? = nil
+    
+    var body: some View {
+        NavigationStack {
+            ZStack(alignment: .bottom) {
+                // Expanded Map
+                Map(coordinateRegion: $region, annotationItems: locationMarkers) { marker in
+                    MapAnnotation(coordinate: marker.coordinate) {
+                        NavigationLink {
+                            if let cityGroup = analyzer.locationsBreakdown.first(where: { $0.name == marker.name }) {
+                                cityGalleryView(cityName: cityGroup.name, assets: cityGroup.assets)
+                            }
+                        } label: {
+                            CityMapPin(assetIdentifier: marker.firstAssetIdentifier, count: marker.count)
+                        }
+                    }
+                }
+                .ignoresSafeArea(edges: .bottom)
+                
+                // Floating Actions
+                HStack(spacing: 16) {
+                    Button(action: {
+                        shareMapScreenshot()
+                    }) {
+                        Label("Share Travel Map", systemImage: "square.and.arrow.up")
+                            .font(.system(.subheadline, design: .rounded))
+                            .fontWeight(.bold)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 14)
+                            .background(Color.purple)
+                            .cornerRadius(14)
+                            .shadow(color: .purple.opacity(0.3), radius: 8, y: 4)
+                    }
+                }
+                .padding(.bottom, 36)
+            }
+            .navigationTitle("Travel Footprints Map")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") {
+                        dismiss()
+                    }
+                    .foregroundColor(.purple)
+                }
+            }
+            .sheet(item: Binding(
+                get: { sharingImage == nil ? nil : ShareItemContainer(items: [sharingImage!]) },
+                set: { sharingImage = $0?.items.first as? UIImage }
+            )) { container in
+                ShareSheet(activityItems: container.items)
+            }
+        }
+    }
+    
+    private var locationMarkers: [LocationMarker] {
+        var markers: [LocationMarker] = []
+        for group in analyzer.locationsBreakdown {
+            if let firstAsset = group.assets.first(where: { $0.latitude != nil && $0.longitude != nil }) {
+                markers.append(LocationMarker(
+                    name: group.name,
+                    coordinate: CLLocationCoordinate2D(latitude: firstAsset.latitude!, longitude: firstAsset.longitude!),
+                    count: group.count,
+                    firstAssetIdentifier: firstAsset.localIdentifier
+                ))
+            }
+        }
+        return markers
+    }
+    
+    private func shareMapScreenshot() {
+        let renderView = VStack(spacing: 16) {
+            VStack(spacing: 4) {
+                Text("🗺️ My Travel Footprints")
+                    .font(.system(.title3, design: .rounded))
+                    .fontWeight(.bold)
+                    .foregroundColor(.primary)
+                
+                Text("\(analyzer.locationsBreakdown.count) Cities • \(analyzer.stats.totalCount) Photos Analyzed")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.top, 24)
+            
+            // Map capture
+            Map(coordinateRegion: .constant(region), annotationItems: locationMarkers) { marker in
+                MapAnnotation(coordinate: marker.coordinate) {
+                    CityMapPin(assetIdentifier: marker.firstAssetIdentifier, count: marker.count)
+                }
+            }
+            .frame(width: 330, height: 330)
+            .cornerRadius(20)
+            .overlay(
+                RoundedRectangle(cornerRadius: 20)
+                    .stroke(Color.borderLight, lineWidth: 1)
+            )
+            .padding(.horizontal, 20)
+            
+            VStack(spacing: 8) {
+                Text("Cities Visited:")
+                    .font(.caption)
+                    .fontWeight(.bold)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                
+                let names = analyzer.locationsBreakdown.map { $0.name.components(separatedBy: ",").first ?? $0.name }.joined(separator: " • ")
+                Text(names)
+                    .font(.caption2)
+                    .foregroundColor(.primary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+            }
+            .padding(.horizontal, 24)
+            .padding(.bottom, 24)
+        }
+        .frame(width: 370)
+        .background(Color.mainBg)
+        .preferredColorScheme(.light)
+        
+        let renderer = ImageRenderer(content: renderView)
+        renderer.scale = 3.0
+        if let image = renderer.uiImage {
+            self.sharingImage = image
+        }
+    }
+    
+    private func cityGalleryView(cityName: String, assets: [AnalyzedAsset]) -> some View {
+        ScrollView {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 4), count: 3), spacing: 4) {
+                ForEach(assets) { asset in
+                    ZStack {
+                        Color.cardBg
+                        Image(systemName: asset.mediaType == .video ? "video" : "photo")
+                            .foregroundColor(.secondary.opacity(0.3))
+                    }
+                    .aspectRatio(1.0, contentMode: .fit)
+                }
+            }
+            .padding()
+        }
+        .navigationTitle(cityName)
+        .background(Color.mainBg)
     }
 }

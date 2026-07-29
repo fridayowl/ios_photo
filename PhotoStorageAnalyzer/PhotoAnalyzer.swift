@@ -150,6 +150,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     public override init() {
         super.init()
         self.loadAlbums()
+        self.loadLocationCache()
         self.loadCache()
         
         #if targetEnvironment(simulator)
@@ -205,6 +206,16 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
         if let encoded = try? JSONEncoder().encode(self.analyzedAssets) {
             UserDefaults.standard.set(encoded, forKey: "cached_analyzed_assets")
         }
+    }
+    
+    private func loadLocationCache() {
+        if let cached = UserDefaults.standard.dictionary(forKey: "geocoded_locations_cache") as? [String: String] {
+            self.locationCache = cached
+        }
+    }
+    
+    private func saveLocationCache() {
+        UserDefaults.standard.set(self.locationCache, forKey: "geocoded_locations_cache")
     }
     
     public func startScan() async {
@@ -272,6 +283,7 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
                 let end = min(i + batchSize, newCount)
                 let batch = Array(newAssetsToScan[i..<end])
                 
+                let cacheSnapshot = self.locationCache
                 let batchResults = await withTaskGroup(of: AnalyzedAsset?.self) { group in
                     for asset in batch {
                         group.addTask {
@@ -300,7 +312,8 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
                             
                             let locName: String?
                             if let loc = asset.location {
-                                locName = String(format: "Location (%.2f, %.2f)", loc.coordinate.latitude, loc.coordinate.longitude)
+                                let key = String(format: "%.2f,%.2f", loc.coordinate.latitude, loc.coordinate.longitude)
+                                locName = cacheSnapshot[key] ?? String(format: "Location (%.2f, %.2f)", loc.coordinate.latitude, loc.coordinate.longitude)
                             } else {
                                 locName = nil
                             }
@@ -473,21 +486,76 @@ public final class PhotoAnalyzer: NSObject, ObservableObject {
     }
     
     private func calculateLocationsBreakdown() {
-        var groups: [String: [AnalyzedAsset]] = [:]
+        var coordinateGroups: [String: [AnalyzedAsset]] = [:]
         for asset in analyzedAssets {
-            if let name = asset.locationName {
-                groups[name, default: []].append(asset)
-            }
+            guard let lat = asset.latitude, let lon = asset.longitude else { continue }
+            let key = String(format: "%.2f,%.2f", lat, lon)
+            coordinateGroups[key, default: []].append(asset)
         }
         
-        self.locationsBreakdown = groups.map { 
-            LocationGroup(
-                name: $0.key,
-                count: $0.value.count,
-                size: $0.value.reduce(0) { $0 + $1.fileSize },
-                assets: $0.value
+        var tempGroups: [LocationGroup] = []
+        for (coordinateKey, assets) in coordinateGroups {
+            let name = self.locationCache[coordinateKey] ?? "Location (\(coordinateKey))"
+            
+            let group = LocationGroup(
+                name: name,
+                count: assets.count,
+                size: assets.reduce(0) { $0 + $1.fileSize },
+                assets: assets
             )
-        }.sorted(by: { $0.size > $1.size })
+            tempGroups.append(group)
+            
+            if self.locationCache[coordinateKey] == nil {
+                geocodeCoordinateKey(coordinateKey, assets: assets)
+            }
+        }
+        self.locationsBreakdown = tempGroups.sorted(by: { $0.size > $1.size })
+    }
+    
+    private func geocodeCoordinateKey(_ key: String, assets: [AnalyzedAsset]) {
+        guard let first = assets.first,
+              let lat = first.latitude,
+              let lon = first.longitude else { return }
+        
+        let location = CLLocation(latitude: lat, longitude: lon)
+        CLGeocoder().reverseGeocodeLocation(location) { placemarks, error in
+            guard let placemark = placemarks?.first,
+                  let city = placemark.locality,
+                  let country = placemark.country else { return }
+            
+            let name = "\(city), \(country)"
+            DispatchQueue.main.async {
+                self.locationCache[key] = name
+                self.saveLocationCache()
+                
+                var updated = self.analyzedAssets
+                for i in 0..<updated.count {
+                    if let aLat = updated[i].latitude, let aLon = updated[i].longitude {
+                        let aKey = String(format: "%.2f,%.2f", aLat, aLon)
+                        if aKey == key {
+                            updated[i] = AnalyzedAsset(
+                                localIdentifier: updated[i].localIdentifier,
+                                fileName: updated[i].fileName,
+                                fileSize: updated[i].fileSize,
+                                isLocallyAvailable: updated[i].isLocallyAvailable,
+                                mediaType: updated[i].mediaType,
+                                isScreenshot: updated[i].isScreenshot,
+                                isLivePhoto: updated[i].isLivePhoto,
+                                creationDate: updated[i].creationDate,
+                                duration: updated[i].duration,
+                                syncStatus: updated[i].syncStatus,
+                                locationName: name,
+                                latitude: aLat,
+                                longitude: aLon
+                            )
+                        }
+                    }
+                }
+                self.analyzedAssets = updated
+                self.calculateStats()
+                self.saveCache()
+            }
+        }
     }
     
     private func calculateSimilarPhotos() {
